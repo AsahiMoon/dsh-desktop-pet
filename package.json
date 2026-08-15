@@ -19,6 +19,8 @@
     "test": "vitest run",
     "dist": "electron-builder --win",
     "dist:portable": "electron-builder --win portable",
+    "dist:mac": "electron-builder --mac",
+    "dist:linux": "electron-builder --linux",
     "smoke:menu": "node scripts/smoke/smoke-menu.cjs",
     "smoke:pierce": "node scripts/smoke/smoke-pierce.cjs",
     "smoke:idle": "node scripts/smoke/smoke-idle.cjs",
@@ -101,6 +103,21 @@
       ],
       "icon": "build/icon.ico",
       "signAndEditExecutable": false
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "build/icon.icns",
+      "category": "public.app-category.entertainment"
+    },
+    "linux": {
+      "target": [
+        "AppImage"
+      ],
+      "icon": "build/icons",
+      "category": "Utility"
     },
     "nsis": {
       "oneClick": false,

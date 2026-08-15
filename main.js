@@ -15,6 +15,10 @@ const http = require("http");
 const { pathToFileURL } = require("url");
 // Native Win32 calls (z-order bottom, taskbar styles). Loaded at top level so
 // every helper can decode window handles from Electron's native-handle Buffers.
+// koffi itself is cross-platform (prebuilt for win/mac/linux); the USER32
+// specific calls below are guarded to win32 and degrade to Electron's native
+// behavior elsewhere.
+const IS_WIN = process.platform === "win32";
 const koffi = require("koffi");
 
 const ROOT = __dirname;
@@ -30,8 +34,8 @@ const IGNORE_FILE = () => path.join(app.getPath("userData"), "characters", ".ign
 // Pin the userData directory to the app name regardless of how electron is
 // launched (unpacked dev runs default to %APPDATA%/Electron otherwise).
 app.setName("dsh-desktop-pet");
-// Taskbar grouping + correct icon association on Windows
-app.setAppUserModelId("com.dsh.desktop-pet");
+// Taskbar grouping + correct icon association (Windows-only API; no-op safe)
+if (IS_WIN) app.setAppUserModelId("com.dsh.desktop-pet");
 
 const STATE_FILE = () => path.join(app.getPath("userData"), "pet-state.json");
 const CONFIG_FILE = () => path.join(app.getPath("userData"), "config.json");
@@ -105,20 +109,23 @@ function loadConfig() {
  * z-order push uses SetWindowPos(HWND_BOTTOM) through koffi.
  */
 let moveWindowBottom = null;
-try {
-  const koffi = require("koffi");
-  const user32 = koffi.load("user32.dll");
-  const setWindowPos = user32.func(
-    "bool SetWindowPos(intptr_t hWnd, intptr_t hWndInsertAfter, int x, int y, int cx, int cy, uint flags)",
-  );
-  const SWP_NOSIZE = 0x0001;
-  const SWP_NOMOVE = 0x0002;
-  const SWP_NOACTIVATE = 0x0010;
-  moveWindowBottom = (hwnd) => {
-    setWindowPos(hwnd, 1 /* HWND_BOTTOM */, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
-  };
-} catch {
-  /* koffi unavailable — bottom mode falls back to alwaysOnTop:false only */
+if (IS_WIN) {
+  try {
+    const user32 = koffi.load("user32.dll");
+    const setWindowPos = user32.func(
+      "bool SetWindowPos(intptr_t hWnd, intptr_t hWndInsertAfter, int x, int y, int cx, int cy, uint flags)",
+    );
+    const SWP_NOSIZE = 0x0001;
+    const SWP_NOMOVE = 0x0002;
+    const SWP_NOACTIVATE = 0x0010;
+    moveWindowBottom = (hwnd) => {
+      setWindowPos(hwnd, 1 /* HWND_BOTTOM */, 0, 0, 0, 0, SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE);
+    };
+  } catch {
+    /* koffi unavailable — bottom mode falls back to alwaysOnTop:false only */
+  }
+} else {
+  // non-Windows: bottom mode falls back to setAlwaysOnTop(false)
 }
 
 /**
@@ -129,25 +136,30 @@ try {
  * Windows re-adds taskbar buttons for eligible windows when they are shown.
  */
 let forceToolWindow = null;
-try {
-  const koffi2 = require("koffi");
-  const user32b = koffi2.load("user32.dll");
-  const getExStyle = user32b.func("intptr_t GetWindowLongPtrW(intptr_t hwnd, int32 index)");
-  const setExStyle = user32b.func("intptr_t SetWindowLongPtrW(intptr_t hwnd, int32 index, intptr_t value)");
-  const GWL_EXSTYLE = -20;
-  const WS_EX_TOOLWINDOW = 0x00000080;
-  forceToolWindow = (hwnd) => {
-    const ex = Number(getExStyle(hwnd, GWL_EXSTYLE));
-    setExStyle(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
-  };
-} catch {
-  /* koffi unavailable — rely on win.setSkipTaskbar() only */
+if (IS_WIN) {
+  try {
+    const user32b = koffi.load("user32.dll");
+    const getExStyle = user32b.func("intptr_t GetWindowLongPtrW(intptr_t hwnd, int32 index)");
+    const setExStyle = user32b.func("intptr_t SetWindowLongPtrW(intptr_t hwnd, int32 index, intptr_t value)");
+    const GWL_EXSTYLE = -20;
+    const WS_EX_TOOLWINDOW = 0x00000080;
+    forceToolWindow = (hwnd) => {
+      const ex = Number(getExStyle(hwnd, GWL_EXSTYLE));
+      setExStyle(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
+    };
+  } catch {
+    /* koffi unavailable — rely on win.setSkipTaskbar() only */
+  }
+} else {
+  // macOS / Linux: skipTaskbar is native, no extra work needed
 }
 
 /** Decode an Electron native-window-handle Buffer into a plain integer HWND
  *  (getNativeWindowHandle() returns a Buffer CONTAINING the handle value —
- *  passing the Buffer straight to koffi would pass the buffer's own address). */
+ *  passing the Buffer straight to koffi would pass the buffer's own address).
+ *  Only meaningful on Windows. */
 function nativeHwnd(win) {
+  if (!IS_WIN) return null;
   try {
     return Number(koffi.decode(win.getNativeWindowHandle(), "intptr_t"));
   } catch {
@@ -858,14 +870,12 @@ function setupIpc() {
     }
     if (!items.length) return;
     const menu = Menu.buildFromTemplate(items);
-    // Electron's native MenuViews::PopupAt() interprets x/y as coordinates
-    // RELATIVE TO THE WINDOW'S CONTENT ORIGIN, NOT screen coordinates
-    // (verified empirically against v33.4.11 source: global screen points put
-    // the anchor off-screen and Windows clamped the menu to a display corner).
-    // The renderer sends the click's clientX/clientY — window-local CSS px,
-    // immune to multi-display coordinate drift — and the native code adds the
-    // content origin back. Missing coords (-1/-1) make Electron use the real
-    // mouse position (GetCursorScreenPoint) instead.
+    // Native popup coordinate semantics (verified against v33.4.11 source):
+    // ALL platforms treat x/y as window-content-relative — Windows/Linux via
+    // MenuViews::PopupAt (location = contentOrigin + (x,y)), macOS via
+    // MenuMac::PopupAt (position = (x, viewHeight - y) in view space). So the
+    // renderer's clientX/clientY pass straight through everywhere; missing
+    // coords (-1/-1) make the platform use the real mouse position.
     const x = Number.isFinite(pos?.x) ? Math.round(pos.x) : -1;
     const y = Number.isFinite(pos?.y) ? Math.round(pos.y) : -1;
     menu.popup({ window: win, x, y });

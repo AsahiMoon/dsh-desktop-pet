@@ -9,8 +9,24 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
-    runs-on: windows-latest
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            script: npm run dist
+            artifact: dsh-desktop-pet-win
+          - os: macos-latest
+            script: npm run dist:mac
+            artifact: dsh-desktop-pet-mac
+          - os: ubuntu-latest
+            script: npm run dist:linux
+            artifact: dsh-desktop-pet-linux
+    runs-on: ${{ matrix.os }}
+    env:
+      # unsigned builds on macOS / Linux (no signing identity in CI)
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
     steps:
       - uses: actions/checkout@v4
 
@@ -28,14 +44,17 @@ jobs:
       - name: Unit tests
         run: npm test
 
-      - name: Package (nsis + portable)
-        run: npm run dist
+      - name: Package
+        run: ${{ matrix.script }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-desktop-pet-win
+          name: ${{ matrix.artifact }}
           path: |
             dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
             dist/*.blockmap
           if-no-files-found: error

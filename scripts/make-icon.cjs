@@ -149,3 +149,47 @@ fs.mkdirSync(outDir, { recursive: true });
 const icoPath = path.join(outDir, "icon.ico");
 fs.writeFileSync(icoPath, icoBuf);
 console.log("wrote", icoPath, icoBuf.length, "bytes");
+
+// ---------- cross-platform icons ----------
+// nearest-neighbor downscale of the RGBA frame
+function downscale(rgba, from, to) {
+  const out = Buffer.alloc(to * to * 4);
+  for (let y = 0; y < to; y++) {
+    const sy = Math.min(from - 1, Math.floor((y * from) / to));
+    for (let x = 0; x < to; x++) {
+      const sx = Math.min(from - 1, Math.floor((x * from) / to));
+      rgba.copy(out, (y * to + x) * 4, (sy * from + sx) * 4, (sy * from + sx) * 4 + 4);
+    }
+  }
+  return out;
+}
+function icnsFromPngs(entries) {
+  // entries: [{ type: 'ic07'|'ic08'|'ic09'|'ic10', png: Buffer }]
+  let body = Buffer.alloc(0);
+  for (const e of entries) {
+    const head = Buffer.alloc(8);
+    head.write(e.type, 0, "ascii");
+    head.writeUInt32BE(8 + e.png.length, 4);
+    body = Buffer.concat([body, head, e.png]);
+  }
+  const header = Buffer.alloc(8);
+  header.write("icns", 0, "ascii");
+  header.writeUInt32BE(8 + body.length, 4);
+  return Buffer.concat([header, body]);
+}
+
+const icns = icnsFromPngs([
+  { type: "ic08", png: writePngRgba(cell, cell, rgba) }, // 256
+  { type: "ic07", png: writePngRgba(cell / 2, cell / 2, downscale(rgba, cell, cell / 2)) }, // 128
+]);
+fs.writeFileSync(path.join(outDir, "icon.icns"), icns);
+console.log("wrote", path.join(outDir, "icon.icns"), icns.length, "bytes");
+
+// Linux icon set (electron-builder reads build/icons/)
+const iconsDir = path.join(outDir, "icons");
+fs.mkdirSync(iconsDir, { recursive: true });
+for (const size of [16, 32, 48, 64, 128, 256]) {
+  const px = downscale(rgba, cell, size);
+  fs.writeFileSync(path.join(iconsDir, `${size}x${size}.png`), writePngRgba(size, size, px));
+}
+console.log("wrote linux icons to", iconsDir);

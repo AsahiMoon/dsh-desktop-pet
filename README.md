@@ -44,14 +44,28 @@ dsh plugin --profile web add <本包路径>
 ### 形态二：独立 exe
 
 ```sh
-npm run dist            # 生成 dist/ 下安装器（nsis）与便携版（portable）
+npm run dist            # Windows：dist/ 下安装器（nsis）与便携版（portable）
 npm run dist:portable   # 只要便携版单文件 exe
+npm run dist:mac        # macOS：dmg + zip
+npm run dist:linux      # Linux：AppImage
 ```
 
 双击即用。exe 版的 Agent 联动需要插件形态（Node half 在 DSH 进程内），其余本地行为
 （打盹/游走/喂食/玩耍/成长）完整可用。
 
-> 也可以从 GitHub Releases（CI 自动构建产物）直接下载 exe。
+> 也可以从 GitHub Releases（CI 三平台自动构建产物）直接下载安装包。
+
+### 跨平台
+
+- **Windows**：原生优化——任务栏隐藏（WS_EX_TOOLWINDOW）、桌面置底（SetWindowPos）
+  走 Win32；DPI 漂移处理针对透明窗口做了专门适配
+- **macOS / Linux**：自动降级为 Electron 原生能力（`skipTaskbar` / `setAlwaysOnTop(false)`），
+  无需额外配置即可运行
+- 右键菜单坐标语义已按 Electron v33 三平台源码逐一验证（Windows/Linux 的
+  `MenuViews::PopupAt`、macOS 的 `MenuMac::PopupAt`），均以窗口相对坐标传入，
+  多屏/多 DPI 下位置一致
+- 图标三平台齐备（ico / icns / png 图标集），由 `scripts/make-icon.cjs` 从鲸鱼娘
+  素材自动生成
 
 ## 🔗 DSH 状态联动
 
@@ -147,7 +161,7 @@ npm start          # 运行宠物窗口（独立模式）
 npm run dev        # 开发模式（附带 DevTools）
 npm run check      # 语法检查
 npm test           # 单元测试（vitest：任务信号跟踪 / 状态机 / 黑框文案）
-npm run dist       # 打包 exe（nsis + portable）
+npm run dist       # 打包 Windows exe（nsis + portable）；另有 dist:mac / dist:linux
 ```
 
 ### 冒烟测试（scripts/smoke/）
@@ -179,8 +193,8 @@ git push -u origin main
 git tag v0.2.0 && git push origin v0.2.0   # 触发 CI 构建 exe 产物（Actions → Artifacts）
 ```
 
-CI（`.github/workflows/build.yml`）会在 main 分支与 `v*` tag 上自动跑 `npm run dist`
-并上传 exe 产物。
+CI（`.github/workflows/build.yml`）会在 main 分支与 `v*` tag 上自动跑单测 + 语法检查，
+并在 **Windows / macOS / Linux 三平台**打包各自产物上传。
 
 ### npm
 
