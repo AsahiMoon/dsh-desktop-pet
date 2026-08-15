@@ -41,6 +41,11 @@ dsh plugin --profile web add <本包路径>
 安装后**重启 `dsh web`**：插件随 profile 加载，自动在桌面启动宠物窗口并开始监听 Agent
 状态。卸载：`dsh plugin --profile web remove @asahimoon/dsh-desktop-pet`。
 
+> **宠物窗口怎么启动**：插件优先用本机可解析到的 electron（开发环境 / 本地安装自带），
+> 找不到时会自动复用已安装的独立版 exe（`%LOCALAPPDATA%\Programs\` 等位置）。
+> 两者都没有时，插件只发信号、不启动窗口——可先按「形态二」装好独立版 exe，Agent 联动
+> 照常工作。宠物意外崩溃（非主动退出）会自动重启，最多重试 5 次。
+
 ### 形态二：独立 exe
 
 ```sh

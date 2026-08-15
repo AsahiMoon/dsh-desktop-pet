@@ -19,8 +19,10 @@
  * sync channel and the settings-backed hot config.
  */
 import { spawn } from "node:child_process";
+import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 import { DEFAULTS, NAMESPACE, buildSchema, validateConfig } from "./config.mjs";
 
 export const name = "dsh-desktop-pet";
@@ -30,13 +32,58 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 43991;
 const HOST = "127.0.0.1";
 
-/** Resolve the electron executable shipped with this package (dependency). */
+/** Resolve an executable that can run main.js: the electron package when it is
+ *  installed anywhere up the node_modules tree (dev setups, local installs),
+ *  or the standalone installed app when electron is absent (npm-published
+ *  installs — electron is a devDependency, so a plain `npm install` of this
+ *  bundle does not ship it). Returns null when neither exists. */
 let electronPath = null;
 try {
   const mod = await import("electron");
   electronPath = typeof mod.default === "string" ? mod.default : null;
 } catch {
-  /* electron not installed here — the pet cannot be spawned, sync still works */
+  /* not resolvable from this tree */
+}
+if (!electronPath) {
+  try {
+    const req = createRequire(import.meta.url);
+    const mod = req("electron");
+    electronPath = typeof mod === "string" ? mod : null;
+  } catch {
+    /* electron not installed anywhere up the tree */
+  }
+}
+
+/** Find the user-installed standalone pet executable (electron-builder NSIS
+ *  default per-user install dir, or anywhere under Program Files). */
+function findInstalledPetExe() {
+  if (process.platform !== "win32") return null;
+  const roots = [
+    path.join(process.env.LOCALAPPDATA ?? "", "Programs"),
+    process.env.PROGRAMFILES ?? "C:\\Program Files",
+    process.env.LOCALAPPDATA ?? "",
+  ];
+  for (const root of roots) {
+    let entries = [];
+    try {
+      entries = fs.readdirSync(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const e of entries) {
+      if (!e.isDirectory() || !/dsh[ -]desktop[ -]pet/i.test(e.name)) continue;
+      const dir = path.join(root, e.name);
+      let files = [];
+      try {
+        files = fs.readdirSync(dir);
+      } catch {
+        continue;
+      }
+      const exe = files.find((f) => /\.exe$/i.test(f) && !/setup|uninstall/i.test(f));
+      if (exe) return path.join(dir, exe);
+    }
+  }
+  return null;
 }
 
 /** Fire one signal toward the pet window (local HTTP POST). Best-effort. */
@@ -53,17 +100,41 @@ async function sendSignal(signal) {
   }
 }
 
-/** Spawn the pet window if electron is available. */
+// Crash recovery: a spawned pet that dies unexpectedly (non-zero exit) is
+// restarted with a small backoff, capped so a hard-failing install does not
+// respawn forever. A zero exit is a deliberate quit (tray -> 退出) and never
+// resurrects the pet.
+let petRespawnTimer = null;
+let petRespawnAttempts = 0;
+let petRespawnResetTimer = null;
+
+/** Spawn the pet window if a runnable electron / installed exe exists. */
 function ensurePet() {
-  if (!electronPath) return;
+  const exe = electronPath ?? findInstalledPetExe();
+  if (!exe) return;
+  clearTimeout(petRespawnTimer);
   try {
-    const child = spawn(electronPath, [path.join(ROOT, "main.js")], {
+    const child = spawn(exe, [path.join(ROOT, "main.js")], {
       stdio: "ignore",
       detached: false,
       windowsHide: true,
     });
     child.on("error", () => {});
+    child.on("exit", (code) => {
+      if (code !== 0 && petRespawnAttempts < 5) {
+        petRespawnAttempts++;
+        const delay = Math.min(60_000, 10_000 * petRespawnAttempts);
+        petRespawnTimer = setTimeout(ensurePet, delay);
+      }
+    });
     child.unref();
+    // a pet that stays alive long enough is healthy — reset the crash counter
+    // so a later one-off crash still gets a fresh restart budget
+    clearTimeout(petRespawnResetTimer);
+    petRespawnResetTimer = setTimeout(() => {
+      petRespawnAttempts = 0;
+    }, 60_000);
+    petRespawnResetTimer.unref?.();
   } catch {
     /* spawn failed — pet stays off, sync messages go nowhere */
   }
@@ -103,6 +174,31 @@ export function apply(ctx) {
   let waiting = false;
   let activeTools = 0;
   let lastTodo = [];
+
+  // When several sessions exist (multiple agents in the web UI), concurrent
+  // sessions would fight over the pet's one state box. Only the MOST RECENTLY
+  // ACTIVE session drives the pet; after it stays quiet for SESSION_STALE_MS,
+  // a different session may take over. (jobs/onJobDone stays unfiltered: a
+  // completed job celebrating is welcome from any session.)
+  const SESSION_STALE_MS = 30_000;
+  let activeSessionId = null;
+  let activeSessionAt = 0;
+  const isCurrentSession = (sid) => {
+    const now = Date.now();
+    if (sid == null) return true; // unknown identity — don't drop events
+    if (activeSessionId === null || sid === activeSessionId) {
+      activeSessionId = sid;
+      activeSessionAt = now;
+      return true;
+    }
+    if (now - activeSessionAt > SESSION_STALE_MS) {
+      activeSessionId = sid;
+      activeSessionAt = now;
+      return true;
+    }
+    return false; // another session is currently driving the pet
+  };
+
   const heartbeat = setInterval(() => {
     sendSignal({
       type: "sync",
@@ -162,7 +258,8 @@ export function apply(ctx) {
 
     // Session log edges drive think / exec / todo / wait / celebrate.
     // Event shape (dsh-session SessionEventMap): { type, seq, time, data }.
-    ctx.on("session/event", (_session, event) => {
+    ctx.on("session/event", (session, event) => {
+      if (!isCurrentSession(session?.id)) return;
       const type = event?.type;
       if (type === "turn/start") {
         thinking = true;
@@ -203,6 +300,10 @@ export function apply(ctx) {
 
   ctx.effect(() => () => {
     clearInterval(heartbeat);
+    clearTimeout(petRespawnTimer);
+    clearTimeout(petRespawnResetTimer);
+    // note: the spawned pet is NOT killed here — the user may want it to keep
+    // running when the plugin unloads (e.g. dsh web restarts)
     for (const dispose of disposers) {
       if (typeof dispose === "function") dispose();
     }

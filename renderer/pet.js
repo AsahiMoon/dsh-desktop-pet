@@ -30,7 +30,6 @@ const DEFAULT_CONFIG = Object.freeze({
 const TICK_ACTIVE_MS = 60_000; // +1 xp per minute of company
 const XP_FEED = 5;
 const XP_PLAY = 5;
-const MENU_OPEN_MS = 4_000; // unused (native menu) — kept for reference
 const BUBBLE_MS = 1_800;
 const POST_WORK_NAP_MS = 25_000; // doze duration after a DSH task completes
 
@@ -59,6 +58,12 @@ let ROLES = [];
 // across files, so we must NOT re-declare any core name (e.g. DEFAULT_LEDGER)
 // — always go through C.*.
 const C = window.PetCore;
+
+// settings window mode: rendered with ?settings=1 — only the panel, no pet.
+// Declared at the TOP so every module-scope registration below can skip pet
+// behavior: the settings window must not process agent signals (STATES is
+// null there — a state flip would crash), drag the pet, or touch the ledger.
+const SETTINGS_MODE = typeof location !== "undefined" && new URLSearchParams(location.search).get("settings") === "1";
 
 // ---------------------------------------------------------------------------
 // config application (hot, from signals or boot)
@@ -203,14 +208,21 @@ async function codexToStates(base, pet) {
   return states;
 }
 
+// Load-race guard: character loading is async (manifest/codex fetch + image
+// decode). Rapidly switching characters starts several loads at once; only the
+// MOST RECENT request may apply its result, otherwise the pet can end up
+// showing a stale character.
+let loadToken = 0;
 async function loadCharacter(id) {
   if (!/^[a-z0-9-]+$/.test(id)) return;
+  const token = ++loadToken;
   const base = `${CHARACTERS_BASE}${id}/`;
   try {
     // 1) native format: manifest.json
     const manifest = await (await fetch(`${base}manifest.json`)).json();
     const ch = manifest.characters?.[id] ?? manifest.characters?.[manifest.default];
     if (ch && ch.states) {
+      if (token !== loadToken) return; // superseded by a newer load
       CHARACTER_ID = id;
       ASSET_BASE = base;
       STATES = ch.states;
@@ -224,13 +236,14 @@ async function loadCharacter(id) {
     // 2) Codex pet format: pet.json + spritesheet
     const pet = await (await fetch(`${base}pet.json`)).json();
     const states = await codexToStates(base, pet);
+    if (token !== loadToken) return;
     CHARACTER_ID = id;
     ASSET_BASE = base; // unused for codex pets (sheets are inline data URLs)
     STATES = states;
     if (stage.dataset.state) setState(stage.dataset.state);
     return;
   } catch (err) {
-    console.error(`character ${id} codex load failed:`, err.message);
+    if (token === loadToken) console.error(`character ${id} codex load failed:`, err.message);
   }
 }
 
@@ -624,6 +637,7 @@ let pierceMode = false;
 let lastDragWasMove = false;
 
 petEl.addEventListener("mousedown", (e) => {
+  if (SETTINGS_MODE) return; // the settings window never drags the pet
   if (e.button !== 0) return;
   if (settingsEl.contains(e.target)) return;
   if (pierceMode) return;
@@ -666,6 +680,7 @@ window.addEventListener("mouseup", (e) => {
 
 // right-click opens the native action menu (left button is pure drag now)
 petEl.addEventListener("contextmenu", (e) => {
+  if (SETTINGS_MODE) return;
   e.preventDefault();
   if (settingsEl.contains(e.target)) return;
   if (pierceMode) return;
@@ -685,10 +700,16 @@ function availableActions() {
   return actions;
 }
 
-petEl.addEventListener("mouseenter", showStatusbar);
-petEl.addEventListener("mouseleave", hideStatusbar);
+petEl.addEventListener("mouseenter", () => {
+  if (SETTINGS_MODE) return;
+  showStatusbar();
+});
+petEl.addEventListener("mouseleave", () => {
+  if (SETTINGS_MODE) return;
+  hideStatusbar();
+});
 // native menu item chosen by the user -> same action handler as before
-if (window.petAPI && typeof window.petAPI.onMenuAction === "function") {
+if (!SETTINGS_MODE && window.petAPI && typeof window.petAPI.onMenuAction === "function") {
   window.petAPI.onMenuAction((act) => onMenuAction(act));
 }
 
@@ -749,9 +770,6 @@ function captionCtx() {
 }
 function statusTextPersist() {
   return C.persistText(captionCtx());
-}
-function statusTextDetailed() {
-  return C.detailedText(captionCtx());
 }
 
 // task-progress snapshot from the agent's todo list (todo/write events)
@@ -847,6 +865,7 @@ function maybeWalk() {
 // that fires right after a real drag.
 const CLICK_LINES = ["呀！", "嘿嘿~", "♪", "在呢在呢！", "戳我干嘛~", "好耶！"];
 petEl.addEventListener("click", (e) => {
+  if (SETTINGS_MODE) return;
   if (pierceMode) return;
   if (settingsEl.contains(e.target)) return;
   showPet(); // clicking always brings the pet back
@@ -975,7 +994,11 @@ function handleSignal(signal) {
       break;
   }
 }
-if (window.petAPI && typeof window.petAPI.onSignal === "function") {
+// The settings window must NOT process agent signals: STATES is never loaded
+// there, so any state-driving signal (celebrate/exec/error…) would crash the
+// renderer on playState(STATES[name]) — and the pet itself already handles
+// every signal.
+if (!SETTINGS_MODE && window.petAPI && typeof window.petAPI.onSignal === "function") {
   window.petAPI.onSignal(handleSignal);
 }
 
@@ -990,6 +1013,9 @@ function saveLedgerSoon() {
 }
 
 setInterval(() => {
+  // The settings window runs this same renderer with a FRESH default ledger —
+  // it must never tick or persist growth data (main.js also rejects its saves).
+  if (SETTINGS_MODE) return;
   ledger.activeMs += TICK_ACTIVE_MS;
   const unlocked = C.checkTitles(ledger); // returns newly unlocked title names
   if (unlocked.length) bubble(`🏅 获得称号：${unlocked.join("、")}`);
@@ -1018,8 +1044,7 @@ const FALLBACK_STATES = {
   wait: { sheet: "wait.png", frames: 1, fps: 2, motion: "wiggle", playback: "loop" },
 };
 
-// settings window mode: rendered with ?settings=1 — only the panel, no pet
-const SETTINGS_MODE = typeof location !== "undefined" && new URLSearchParams(location.search).get("settings") === "1";
+// settings window mode: declared at the TOP of this file (see SETTINGS_MODE)
 
 async function boot() {
   // config + roles from the main process (hot config arrives as signals later)
@@ -1047,6 +1072,23 @@ async function boot() {
     } catch {
       /* settings helper unavailable */
     }
+    // Re-scan characters + config whenever the settings window regains focus —
+    // pets installed via petdex (or folders dropped into the characters dir)
+    // and config changed elsewhere (DSH settings UI, tray) show up without
+    // restarting the app. (Agent signals are NOT processed here, so this is
+    // the settings window's only source of config refresh.)
+    window.addEventListener("focus", async () => {
+      try {
+        const init = await window.petAPI.getConfig();
+        if (init?.config) {
+          CONFIG = { ...DEFAULT_CONFIG, ...init.config, walk: { ...DEFAULT_CONFIG.walk, ...(init.config.walk ?? {}) } };
+        }
+        if (Array.isArray(init?.roles)) ROLES = init.roles;
+        fillSettingsValues();
+      } catch {
+        /* ignore */
+      }
+    });
     return;
   }
 

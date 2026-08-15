@@ -1,0 +1,11 @@
+# Normalize text files to LF (avoids CRLF churn across platforms/editors)
+* text=auto eol=lf
+
+# Binary assets — never touch line endings
+*.png binary
+*.ico binary
+*.icns binary
+*.webp binary
+*.jpg binary
+*.jpeg binary
+*.gif binary

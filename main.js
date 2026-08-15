@@ -19,7 +19,15 @@ const { pathToFileURL } = require("url");
 // specific calls below are guarded to win32 and degrade to Electron's native
 // behavior elsewhere.
 const IS_WIN = process.platform === "win32";
-const koffi = require("koffi");
+// koffi loads native bindings — guard the require itself so a missing/broken
+// prebuild degrades to Electron's native behavior instead of crashing the
+// whole app at startup (the USER32 calls below are already try/catch'd).
+let koffi = null;
+try {
+  koffi = require("koffi");
+} catch {
+  /* koffi unavailable — win32 extras fall back to Electron natives */
+}
 
 const ROOT = __dirname;
 // Built-in characters ship inside the (read-only) asar. A SECOND, writable
@@ -283,18 +291,50 @@ function correctForDisplay() {
   }
 }
 
+/**
+ * Clamp a position so the window stays reachable on the CURRENT display set.
+ * - boot mode: a position inside ANY display's work area is kept as-is (the
+ *   pet may legitimately sit on a secondary screen); a position outside every
+ *   area (saved on a now-disconnected display) is pulled back into the union.
+ * - drag mode (keepSliver): the window can be pushed almost off-screen but a
+ *   sliver stays visible so the user can always grab it again.
+ */
+function clampToDisplays(x, y, w, h, keepSliver = false) {
+  const areas = screen.getAllDisplays().map((d) => d.workArea);
+  if (areas.length === 0) return { x, y };
+  if (!keepSliver) {
+    const inside = areas.some(
+      (a) => x >= a.x - 20 && y >= a.y - 20 && x < a.x + a.width && y < a.y + a.height,
+    );
+    if (inside) return { x, y };
+  }
+  const ux = Math.min(...areas.map((a) => a.x));
+  const uy = Math.min(...areas.map((a) => a.y));
+  const ux2 = Math.max(...areas.map((a) => a.x + a.width));
+  const uy2 = Math.max(...areas.map((a) => a.y + a.height));
+  const minX = keepSliver ? ux - (w - 40) : ux;
+  const minY = keepSliver ? uy - (h - 30) : uy;
+  const maxX = keepSliver ? ux2 - 40 : ux2 - Math.min(w, ux2 - ux);
+  const maxY = keepSliver ? uy2 - 30 : uy2 - Math.min(h, uy2 - uy);
+  return {
+    x: Math.round(Math.min(Math.max(x, minX), maxX)),
+    y: Math.round(Math.min(Math.max(y, minY), maxY)),
+  };
+}
+
 function applyWindowConfig(cfg) {
   if (!win || win.isDestroyed()) return;
   const size = Math.max(64, Math.min(256, Math.round(cfg.size ?? DEFAULT_CONFIG.size)));
   if (appliedWindow.size !== size) {
     const [x, y] = win.getPosition();
-    const { width: w, height: h } = win.getBounds(); // getBounds returns an object
     appliedWindow.size = size;
-    // setBounds with the authoritative value (setSize on DPI-scaled
-    // transparent windows drifts; bounds write avoids the read-back)
+    // Anchor the pet's TOP-LEFT corner: the sprite sits at the window's
+    // top-left, so a size change only alters width/height (the pet grows
+    // right/down in place) — re-centering the window would slide the pet
+    // diagonally by (new-old)/2 and feel like it "jumped".
     win.setBounds({
-      x: Math.round(x + (w - (size + WINDOW_EXTRA)) / 2),
-      y: Math.round(y + (h - (size + WINDOW_STRIP)) / 2),
+      x: Math.round(x),
+      y: Math.round(y),
       width: size + WINDOW_EXTRA,
       height: size + WINDOW_STRIP,
     });
@@ -451,9 +491,9 @@ function startSignalServer() {
         if (signal && typeof signal.type === "string") {
           broadcast(signal);
           if (win && !win.isDestroyed()) win.setTitle(`dsh-desktop-pet · ${signal.type}`);
-          // tray tooltip mirrors meaningful agent states
+          // tray tooltip mirrors meaningful agent states (character base + state)
           if (["exec", "working", "think", "wait", "celebrate", "error", "welcome"].includes(signal.type)) {
-            tray?.setToolTip(`dsh-desktop-pet · ${signal.type}`);
+            tray?.setToolTip(`${trayTooltipBase} · ${signal.type}`);
           }
         }
         res.writeHead(200, { "content-type": "application/json" });
@@ -560,7 +600,10 @@ function createWindow() {
   const size = Math.max(64, Math.min(256, Math.round(config.size ?? DEFAULT_CONFIG.size)));
   appliedWindow = { size, opacity: config.opacity ?? 1 };
   const saved = loadState();
-  const pos = saved.x !== null && saved.y !== null ? { x: saved.x, y: saved.y } : defaultPosition();
+  let pos = saved.x !== null && saved.y !== null ? { x: saved.x, y: saved.y } : defaultPosition();
+  // a saved position can land on a display that is no longer connected —
+  // clamp it back into the visible desktop so the pet never spawns off-screen
+  pos = clampToDisplays(pos.x, pos.y, size + WINDOW_EXTRA, size + WINDOW_STRIP);
 
   win = new BrowserWindow({
     width: size + WINDOW_EXTRA,
@@ -641,7 +684,7 @@ function trayIcon() {
 
 function createTray() {
   tray = new Tray(trayIcon());
-  tray.setToolTip("dsh-desktop-pet");
+  refreshTrayTooltip();
   refreshTrayMenu();
   tray.on("click", () => toggleWindow());
 }
@@ -651,6 +694,21 @@ function refreshTrayIcon() {
   if (!tray) return;
   try {
     tray.setImage(trayIcon());
+  } catch {
+    /* best-effort */
+  }
+  refreshTrayTooltip();
+}
+
+/** Tray tooltip base: app name + current character. State signals append the
+ *  agent state on top of this base (see the signal handler). */
+let trayTooltipBase = "dsh-desktop-pet";
+function refreshTrayTooltip() {
+  if (!tray) return;
+  try {
+    const role = scanCharacters().find((c) => c.id === config.character);
+    trayTooltipBase = `dsh-desktop-pet · ${role?.name ?? config.character}`;
+    tray.setToolTip(trayTooltipBase);
   } catch {
     /* best-effort */
   }
@@ -823,9 +881,10 @@ function setupIpc() {
     // delta between two screenX readings is exact. Pin the size too (never
     // re-read win.getSize(): it drifts on transparent windows).
     const { w, h } = authoritativeSize();
+    const target = clampToDisplays(dragAnchor.x + dx, dragAnchor.y + dy, w, h, true);
     win.setBounds({
-      x: Math.round(dragAnchor.x + dx),
-      y: Math.round(dragAnchor.y + dy),
+      x: target.x,
+      y: target.y,
       width: w,
       height: h,
     });
@@ -863,8 +922,11 @@ function setupIpc() {
     }, Math.round(durationMs / steps));
   });
 
-  ipcMain.on("pet:save-ledger", (_e, ledger) => {
-    if (!win) return;
+  ipcMain.on("pet:save-ledger", (e, ledger) => {
+    // ONLY the pet window's ledger is authoritative. The settings window runs
+    // the same renderer (with a fresh default ledger) and would otherwise
+    // overwrite the pet's real growth data with a blank one.
+    if (!win || win.isDestroyed() || e.sender !== win.webContents) return;
     win.ledger = ledger;
     queueSave();
   });
@@ -975,6 +1037,9 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    // a desktop pet doesn't belong in the Dock (Windows/Linux handle this via
+    // skipTaskbar + WS_EX_TOOLWINDOW; macOS shows the Dock icon by default)
+    if (process.platform === "darwin" && app.dock?.hide) app.dock.hide();
     loadConfig();
     importExternalCharacters(); // petdex pets -> userData/characters
     registerPetProtocol();

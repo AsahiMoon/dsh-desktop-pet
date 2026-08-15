@@ -15,7 +15,7 @@
   "scripts": {
     "start": "electron main.js",
     "dev": "electron main.js --dev",
-    "check": "node --check main.js && node --check index.mjs && node --check config.mjs && node --check renderer/core.js",
+    "check": "node --check main.js && node --check preload.js && node --check index.mjs && node --check config.mjs && node --check renderer/core.js && node --check renderer/pet.js",
     "test": "vitest run",
     "dist": "electron-builder --win",
     "dist:portable": "electron-builder --win portable",
