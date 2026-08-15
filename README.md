@@ -1,7 +1,7 @@
 # dsh-desktop-pet · 鲸鱼娘桌面宠物
 
-![npm](https://img.shields.io/npm/v/dsh-desktop-pet)
-![license](https://img.shields.io/npm/l/dsh-desktop-pet)
+![npm](https://img.shields.io/npm/v/@asahimoon/dsh-desktop-pet)
+![license](https://img.shields.io/npm/l/@asahimoon/dsh-desktop-pet)
 ![build](https://img.shields.io/github/actions/workflow/status/AsahiMoon/dsh-desktop-pet/build.yml?branch=main)
 
 一个住在桌面上的 **DSH 联动桌面宠物**：透明、置顶、无边框的 Electron 小窗，鲸鱼娘住在
@@ -32,14 +32,14 @@
 
 ```sh
 # 从 npm 安装（发布后）
-dsh plugin --profile web add dsh-desktop-pet
+dsh plugin --profile web add @asahimoon/dsh-desktop-pet
 
 # 或本地路径安装（开发中）
 dsh plugin --profile web add <本包路径>
 ```
 
 安装后**重启 `dsh web`**：插件随 profile 加载，自动在桌面启动宠物窗口并开始监听 Agent
-状态。卸载：`dsh plugin --profile web remove dsh-desktop-pet`。
+状态。卸载：`dsh plugin --profile web remove @asahimoon/dsh-desktop-pet`。
 
 ### 形态二：独立 exe
 
@@ -188,7 +188,7 @@ npm publish          # 发布前先改好 package.json 里的 author / repositor
 发布后：
 
 ```sh
-dsh plugin --profile web add dsh-desktop-pet
+dsh plugin --profile web add @asahimoon/dsh-desktop-pet
 ```
 
 > 发布前检查：`npm pack --dry-run` 可预览将要发布的内容（`files` 白名单已配置，
