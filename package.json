@@ -122,7 +122,8 @@
         "AppImage"
       ],
       "icon": "build/icons",
-      "category": "Utility"
+      "category": "Utility",
+      "executableName": "dsh-desktop-pet"
     },
     "nsis": {
       "oneClick": false,
