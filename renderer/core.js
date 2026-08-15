@@ -1,3 +1,5 @@
+(function (root) {
+  "use strict";
 /**
  * dsh-desktop-pet — renderer core logic (pure, DOM-free).
  *
@@ -151,6 +153,10 @@ function syncNextState(state, busy, flags) {
 // caption text (the black info box below the pet)
 // ---------------------------------------------------------------------------
 
+/** Seconds of silence (no signals) after which the pet reports the DSH link
+ *  as offline. Mirrors the original whale-girl's "📡 离线…" presence cue. */
+const OFFLINE_AFTER_MS = 15_000;
+
 /** Short status note for the current task (phase + tool, or 空闲中 / 💤). */
 function taskNote(taskState, state) {
   if (state === "sleep") return "💤 睡觉中";
@@ -168,6 +174,7 @@ function taskNote(taskState, state) {
 
 /** Hover summary — abbreviated (like the original whale-girl status card). */
 function hoverText(ctx) {
+  if (ctx.offline) return `[${fmtTime(ctx.now ?? Date.now())}] 📡 连接断开`;
   const { taskState, currentTodos, state, now } = ctx;
   const lines = [`[${fmtTime(now ?? Date.now())}] ${taskNote(taskState, state)}`];
   const done = (currentTodos ?? []).filter((t) => t.status === "completed").length;
@@ -189,7 +196,9 @@ function persistText(ctx) {
 function detailedText(ctx) {
   const { taskState, currentTodos, taskHistory, runHistory, state, now } = ctx;
   const lines = [];
-  if (state === "sleep") {
+  if (ctx.offline) {
+    lines.push(`[${fmtTime(now ?? Date.now())}] 📡 连接断开`);
+  } else if (state === "sleep") {
     lines.push(`[${fmtTime(now ?? Date.now())}] 💤 睡觉中`);
   } else if (taskState.phase !== "idle" && taskState.phase !== "welcome") {
     const head = [
@@ -221,18 +230,77 @@ function detailedText(ctx) {
   return lines.join("\n");
 }
 
+// ---------------------------------------------------------------------------
+// growth ledger (pure, unit-tested like the rest of the core)
+// ---------------------------------------------------------------------------
+
+const TITLES = [
+  { id: "first-feed", name: "初次投喂", when: (s) => s.feeds >= 1 },
+  { id: "regular", name: "常客", when: (s) => s.feeds >= 20 },
+  { id: "veteran", name: "资深伙伴", when: (s) => s.feeds >= 100 },
+  { id: "loyal", name: "常驻伙伴", when: (s) => s.activeMs >= 6 * 3_600_000 },
+  { id: "playful", name: "玩伴", when: (s) => s.plays >= 30 },
+];
+
+const DEFAULT_LEDGER = { xp: 0, feeds: 0, plays: 0, activeMs: 0, firstSeenAt: Date.now(), titles: [] };
+
+/** Level from accumulated XP (triangular-ish curve). */
+function levelFor(xp) {
+  return Math.floor((1 + Math.sqrt(1 + (4 * Math.max(0, xp)) / 25)) / 2);
+}
+
+/** Add XP; returns true when this crossed a level boundary. */
+function addXp(ledger, n) {
+  const before = levelFor(ledger.xp);
+  ledger.xp += n;
+  return levelFor(ledger.xp) > before;
+}
+
+/** Unlock any newly-satisfied titles; returns their display NAMES (empty
+ *  array when nothing new — a pure, non-boolean contract for the UI bubble). */
+function checkTitles(ledger) {
+  const names = [];
+  for (const t of TITLES) {
+    if (t.when(ledger) && !ledger.titles.includes(t.id)) {
+      ledger.titles.push(t.id);
+      names.push(t.name);
+    }
+  }
+  return names;
+}
+
+// ---------------------------------------------------------------------------
+// state-machine helpers
+// ---------------------------------------------------------------------------
+
+/** Suppress a state flip that happens too soon after the current state began
+ *  (their minStateMs idea) — prevents heartbeat jitter (think/work flipping)
+ *  while leaving chain-driven transitions untouched. */
+function debounceTransition(next, current, stateSince, now, minHoldMs = 300) {
+  if (!next || next === current) return next;
+  if (now - stateSince < minHoldMs) return null;
+  return next;
+}
+
 // UMD-ish: browser classic script -> window.PetCore; Node/vitest -> exports.
 const PetCore = {
   GENERIC_TASK_LABELS,
   TASK_PHASE_TEXT,
+  OFFLINE_AFTER_MS,
   fmtTime,
   noteCompleted,
   noteRun,
   applyTaskSignal,
   syncNextState,
+  debounceTransition,
   hoverText,
   persistText,
   detailedText,
+  TITLES,
+  DEFAULT_LEDGER,
+  levelFor,
+  addXp,
+  checkTitles,
 };
 
 if (typeof module !== "undefined" && module.exports) {
@@ -241,3 +309,5 @@ if (typeof module !== "undefined" && module.exports) {
 if (typeof window !== "undefined") {
   window.PetCore = PetCore;
 }
+
+})(typeof window !== "undefined" ? window : null);

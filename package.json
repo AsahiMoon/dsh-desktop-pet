@@ -15,7 +15,7 @@
   "scripts": {
     "start": "electron main.js",
     "dev": "electron main.js --dev",
-    "check": "node --check main.js && node --check index.mjs && node --check config.mjs && node --check renderer/core.cjs",
+    "check": "node --check main.js && node --check index.mjs && node --check config.mjs && node --check renderer/core.js",
     "test": "vitest run",
     "dist": "electron-builder --win",
     "dist:portable": "electron-builder --win portable",
@@ -79,6 +79,11 @@
   "build": {
     "appId": "com.dsh.desktop-pet",
     "productName": "DSH Desktop Pet",
+    "compression": "maximum",
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
     "directories": {
       "output": "dist"
     },

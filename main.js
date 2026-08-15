@@ -7,7 +7,7 @@
  * lives in the renderer; this process owns the window, tray, click-through,
  * position/config persistence, character discovery and the pet:// protocol.
  */
-const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, protocol, net, screen } = require("electron");
+const { app, BrowserWindow, Tray, Menu, ipcMain, nativeImage, protocol, net, screen, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
 const os = require("os");
@@ -36,6 +36,39 @@ const IGNORE_FILE = () => path.join(app.getPath("userData"), "characters", ".ign
 app.setName("dsh-desktop-pet");
 // Taskbar grouping + correct icon association (Windows-only API; no-op safe)
 if (IS_WIN) app.setAppUserModelId("com.dsh.desktop-pet");
+
+// ---------------------------------------------------------------------------
+// file logging — the packaged exe has no visible stdout, so mirror everything
+// to %APPDATA%/dsh-desktop-pet/pet.log (rotated at 1MB)
+// ---------------------------------------------------------------------------
+const LOG_FILE = () => path.join(app.getPath("userData"), "pet.log");
+function writeLog(level, message) {
+  try {
+    const line = `${new Date().toISOString()} [${level}] ${message}\n`;
+    fs.appendFileSync(LOG_FILE(), line);
+    try {
+      if (fs.statSync(LOG_FILE()).size > 1_000_000) {
+        fs.renameSync(LOG_FILE(), LOG_FILE() + ".old");
+      }
+    } catch {
+      /* best-effort */
+    }
+  } catch {
+    /* best-effort */
+  }
+}
+{
+  const _log = console.log.bind(console);
+  const _err = console.error.bind(console);
+  console.log = (...a) => {
+    _log(...a);
+    writeLog("info", a.join(" "));
+  };
+  console.error = (...a) => {
+    _err(...a);
+    writeLog("error", a.join(" "));
+  };
+}
 
 const STATE_FILE = () => path.join(app.getPath("userData"), "pet-state.json");
 const CONFIG_FILE = () => path.join(app.getPath("userData"), "config.json");
@@ -401,11 +434,13 @@ function startSignalServer() {
         const signal = JSON.parse(body);
         if (signal && typeof signal.type === "string" && signal.type === "config" && signal.config) {
           // hot config: merge, persist, apply window-level, forward to all windows
+          const prevCharacter = config.character;
           config = {
             ...DEFAULT_CONFIG,
             ...signal.config,
             walk: { ...DEFAULT_CONFIG.walk, ...(signal.config.walk ?? {}) },
           };
+          if (config.character !== prevCharacter) refreshTrayIcon();
           saveConfig();
           applyWindowConfig(config);
           res.writeHead(200, { "content-type": "application/json" });
@@ -416,6 +451,10 @@ function startSignalServer() {
         if (signal && typeof signal.type === "string") {
           broadcast(signal);
           if (win && !win.isDestroyed()) win.setTitle(`dsh-desktop-pet · ${signal.type}`);
+          // tray tooltip mirrors meaningful agent states
+          if (["exec", "working", "think", "wait", "celebrate", "error", "welcome"].includes(signal.type)) {
+            tray?.setToolTip(`dsh-desktop-pet · ${signal.type}`);
+          }
         }
         res.writeHead(200, { "content-type": "application/json" });
         res.end(JSON.stringify({ ok: true, received: signal.type }));
@@ -607,6 +646,16 @@ function createTray() {
   tray.on("click", () => toggleWindow());
 }
 
+/** Swap the tray icon (e.g. after a character change). */
+function refreshTrayIcon() {
+  if (!tray) return;
+  try {
+    tray.setImage(trayIcon());
+  } catch {
+    /* best-effort */
+  }
+}
+
 /** Rebuild the tray context menu from the CURRENT state so checkbox items
  *  (bottom mode / mouse pierce) always reflect reality — otherwise a stale
  *  checkbox makes the first click re-enable instead of disable. */
@@ -731,6 +780,21 @@ function setupIpc() {
   ipcMain.handle("pet:ready", () => loadState());
 
   ipcMain.handle("pet:get-config", () => ({ config, roles: scanCharacters() }));
+
+  ipcMain.handle("pet:paths", () => ({
+    characters: USER_CHARACTERS_DIR(),
+    configDir: path.dirname(CONFIG_FILE()),
+  }));
+
+  // open a folder in the OS file manager (settings panel helper)
+  ipcMain.on("pet:open-path", (_e, which) => {
+    const p = which === "config" ? path.dirname(CONFIG_FILE()) : USER_CHARACTERS_DIR();
+    try {
+      shell.openPath(p);
+    } catch {
+      /* best-effort */
+    }
+  });
 
   ipcMain.on("pet:drag-start", () => {
     if (!win) return;

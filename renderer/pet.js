@@ -33,13 +33,6 @@ const XP_PLAY = 5;
 const MENU_OPEN_MS = 4_000; // unused (native menu) — kept for reference
 const BUBBLE_MS = 1_800;
 const POST_WORK_NAP_MS = 25_000; // doze duration after a DSH task completes
-const TITLES = [
-  { id: "first-feed", name: "初次投喂", when: (s) => s.feeds >= 1 },
-  { id: "regular", name: "常客", when: (s) => s.feeds >= 20 },
-  { id: "veteran", name: "资深伙伴", when: (s) => s.feeds >= 100 },
-  { id: "loyal", name: "常驻伙伴", when: (s) => s.activeMs >= 6 * 3_600_000 },
-  { id: "playful", name: "玩伴", when: (s) => s.plays >= 30 },
-];
 
 const stage = document.getElementById("stage");
 const petEl = document.getElementById("pet");
@@ -60,29 +53,12 @@ const hideWhenIdleInput = document.getElementById("hide-when-idle");
 let CONFIG = { ...DEFAULT_CONFIG, walk: { ...DEFAULT_CONFIG.walk } };
 let ROLES = [];
 
-// ---------------------------------------------------------------------------
-// growth ledger
-// ---------------------------------------------------------------------------
-const DEFAULT_LEDGER = { xp: 0, feeds: 0, plays: 0, activeMs: 0, firstSeenAt: Date.now(), titles: [] };
-
-function levelFor(xp) {
-  return Math.floor((1 + Math.sqrt(1 + (4 * Math.max(0, xp)) / 25)) / 2);
-}
-function checkTitles(ledger) {
-  let changed = false;
-  for (const t of TITLES) {
-    if (t.when(ledger) && !ledger.titles.includes(t.id)) {
-      ledger.titles.push(t.id);
-      changed = true;
-    }
-  }
-  return changed;
-}
-function addXp(ledger, n) {
-  const before = levelFor(ledger.xp);
-  ledger.xp += n;
-  return levelFor(ledger.xp) > before;
-}
+// Pure logic (task tracking / transitions / caption text / ledger) lives in
+// core.cjs so it is unit-testable; pet.js wires it to the DOM + state machine.
+// NOTE: classic <script> top-level const/let share ONE global lexical scope
+// across files, so we must NOT re-declare any core name (e.g. DEFAULT_LEDGER)
+// — always go through C.*.
+const C = window.PetCore;
 
 // ---------------------------------------------------------------------------
 // config application (hot, from signals or boot)
@@ -296,6 +272,10 @@ const IDLE_PULSES = [
 function scheduleIdleLife() {
   clearTimeout(idleLifeTimer);
   if (state !== "idle" || pierceMode) return;
+  if (petHidden) {
+    idleLifeTimer = setTimeout(scheduleIdleLife, 10_000); // hidden — defer pulses
+    return;
+  }
   idleLifeTimer = setTimeout(() => {
     if (state !== "idle" || pierceMode) return;
     const pulse = IDLE_PULSES[Math.floor(Math.random() * IDLE_PULSES.length)];
@@ -319,9 +299,14 @@ function startMotion(name) {
   const t0 = performance.now();
   const step = () => {
     if (anim.motionName !== name) return;
+    if (petHidden) {
+      // nothing visible — keep the loop alive but almost free (~4fps)
+      anim.motionTimer = setTimeout(step, 250);
+      return;
+    }
     const t = ((performance.now() - t0) / motion.dur) * Math.PI * 2;
     stage.style.transform = motion.apply(t);
-    anim.motionTimer = setTimeout(step, 16);
+    anim.motionTimer = setTimeout(step, 33); // ~30fps is plenty for gentle motions
   };
   step();
 }
@@ -423,6 +408,11 @@ function startFrames() {
   const interval = 1000 / def.fps;
   const step = () => {
     if (anim.def !== def) return;
+    if (petHidden) {
+      // window hidden — slow the frame loop to ~2fps, keep it alive
+      anim.frameTimer = setTimeout(step, 500);
+      return;
+    }
     advanceFrame();
     anim.frameTimer = setTimeout(step, interval);
   };
@@ -463,12 +453,14 @@ function finishState() {
 // state machine
 // ---------------------------------------------------------------------------
 let state = "boot";
+let stateSince = Date.now(); // for heartbeat-transition debounce (min-hold)
 let lastInteractAt = Date.now();
 let lastWalkAt = Date.now();
 let busy = false;
 
 function setState(name, opts = {}) {
   state = name;
+  stateSince = Date.now();
   if (name === "idle" || name === "sleep") lastInteractAt = Date.now();
   playState(name, opts);
   if (name === "idle") {
@@ -510,14 +502,14 @@ function onMenuAction(act) {
     case "feed":
       busy = true;
       ledger.feeds++;
-      addXp(ledger, XP_FEED);
+      C.addXp(ledger, XP_FEED);
       chain(hasDistinct("eat") ? "eat" : "celebrate", 1600, () => chain("joy", 1400, toIdle));
       bubble("🍗 好吃~ 谢谢你！");
       break;
     case "play":
       busy = true;
       ledger.plays++;
-      addXp(ledger, XP_PLAY);
+      C.addXp(ledger, XP_PLAY);
       chain(hasDistinct("play") ? "play" : "celebrate", 1600, () => chain("joy", 1400, toIdle));
       bubble("🎾 接住啦！");
       break;
@@ -748,11 +740,11 @@ function captionCtx() {
     taskHistory,
     runHistory,
     state,
+    offline,
     detailed: !!CONFIG.taskBarDetailed,
     now: Date.now(),
   };
-}
-function statusTextHover() {
+}function statusTextHover() {
   return C.hoverText(captionCtx());
 }
 function statusTextPersist() {
@@ -774,6 +766,7 @@ function applyTodos(todos) {
 function tickIdle() {
   // keep the black box's [HH:MM] clock fresh while it is visible
   if (!statusbarEl.classList.contains("hidden")) renderCaption();
+  if (updateOffline()) renderCaption(); // 📡 offline edge re-renders the caption
   if (busy || state !== "idle") return;
   if (Date.now() - lastInteractAt >= CONFIG.sleepAfterMs) {
     naturalSleep = true;
@@ -791,6 +784,7 @@ let petHidden = false;
 function hidePet() {
   if (petHidden) return;
   petHidden = true;
+  stopMotion(); // nothing to animate while hidden — save CPU
   if (window.petAPI && typeof window.petAPI.setWindowVisible === "function") {
     window.petAPI.setWindowVisible(false);
   }
@@ -802,6 +796,31 @@ function showPet() {
   if (window.petAPI && typeof window.petAPI.setWindowVisible === "function") {
     window.petAPI.setWindowVisible(true);
   }
+  // resume the right motion for the current state
+  if (anim.def?.motion) startMotion(anim.def.motion);
+  else if (state === "idle") {
+    startMotion("bob");
+    scheduleIdleLife();
+  }
+}
+
+// offline detection: the DSH bundle heartbeats every 5s; if we ever received
+// a signal and then go quiet for OFFLINE_AFTER_MS, show 📡 in the caption and
+// relax any stuck agent states (never fires for the standalone exe).
+let lastSignalAt = Date.now();
+let everReceivedSignal = false;
+let offline = false;
+const OFFLINE_AFTER_MS = C.OFFLINE_AFTER_MS;
+
+function updateOffline() {
+  const was = offline;
+  offline = everReceivedSignal && Date.now() - lastSignalAt > OFFLINE_AFTER_MS;
+  if (offline && !was) {
+    // link lost: stop waiting/working poses, relax to idle
+    busy = false;
+    if (state === "think" || state === "working" || state === "wait") setState("idle");
+  }
+  return offline !== was;
 }
 
 function maybeWalk() {
@@ -855,10 +874,6 @@ petEl.addEventListener("click", (e) => {
 // ---------------------------------------------------------------------------
 // DSH agent-state sync (signals pushed over HTTP by the bundle Node half)
 // ---------------------------------------------------------------------------
-// Pure logic (task tracking / transitions / caption text) lives in core.cjs
-// so it is unit-testable; pet.js wires it to the DOM + state machine.
-const C = window.PetCore;
-
 // Current-task info snapshot, maintained from signals and rendered in the
 // black info box below the pet (hover or persistent).
 let taskState = { phase: "idle", tool: null, label: null, todos: [] };
@@ -874,6 +889,9 @@ function trackTaskSignal(signal) {
 
 function handleSignal(signal) {
   if (!signal || typeof signal.type !== "string") return;
+  // any signal proves the DSH link is alive (heartbeat is every 5s)
+  lastSignalAt = Date.now();
+  everReceivedSignal = true;
   trackTaskSignal(signal);
   if (signal.type === "config") {
     applyConfig(signal.config);
@@ -884,7 +902,10 @@ function handleSignal(signal) {
     // heartbeat would otherwise keep the pet awake forever)
     if (Array.isArray(signal.todos)) applyTodos(signal.todos);
     if (signal.exec || signal.think || signal.wait) showPet(); // real activity
-    const next = C.syncNextState(state, busy, { exec: !!signal.exec, think: !!signal.think, wait: !!signal.wait });
+    const rawNext = C.syncNextState(state, busy, { exec: !!signal.exec, think: !!signal.think, wait: !!signal.wait });
+    // min-hold: suppress heartbeat flips that arrive <300ms after the current
+    // state began (prevents think/work jitter from rapid tool transitions)
+    const next = C.debounceTransition(rawNext, state, stateSince, Date.now(), 300);
     if (next === "idle") busy = false;
     if (next) setState(next);
     return;
@@ -961,7 +982,7 @@ if (window.petAPI && typeof window.petAPI.onSignal === "function") {
 // ---------------------------------------------------------------------------
 // persistence
 // ---------------------------------------------------------------------------
-let ledger = { ...DEFAULT_LEDGER };
+let ledger = { ...C.DEFAULT_LEDGER };
 let saveTimer = 0;
 function saveLedgerSoon() {
   clearTimeout(saveTimer);
@@ -970,7 +991,8 @@ function saveLedgerSoon() {
 
 setInterval(() => {
   ledger.activeMs += TICK_ACTIVE_MS;
-  if (checkTitles(ledger)) bubble(`🏅 获得称号：${statusText().split("｜").pop().trim()}`);
+  const unlocked = C.checkTitles(ledger); // returns newly unlocked title names
+  if (unlocked.length) bubble(`🏅 获得称号：${unlocked.join("、")}`);
   saveLedgerSoon();
 }, TICK_ACTIVE_MS);
 
@@ -1015,6 +1037,16 @@ async function boot() {
     document.body.dataset.settings = "";
     settingsEl.classList.remove("hidden");
     fillSettingsValues();
+    // folder paths + open buttons (help users add pets / edit config)
+    try {
+      const paths = await window.petAPI.getPaths();
+      const info = document.getElementById("paths-info");
+      if (info) info.textContent = `角色文件夹：${paths?.characters ?? "—"}`;
+      document.getElementById("open-characters")?.addEventListener("click", () => window.petAPI.openPath("characters"));
+      document.getElementById("open-config")?.addEventListener("click", () => window.petAPI.openPath("config"));
+    } catch {
+      /* settings helper unavailable */
+    }
     return;
   }
 
@@ -1029,7 +1061,7 @@ async function boot() {
   // restore ledger + window position
   try {
     const saved = await window.petAPI.ready();
-    if (saved && saved.ledger) ledger = { ...DEFAULT_LEDGER, ...saved.ledger };
+    if (saved && saved.ledger) ledger = { ...C.DEFAULT_LEDGER, ...saved.ledger };
   } catch { /* first run */ }
 
   stage.classList.add("enter");

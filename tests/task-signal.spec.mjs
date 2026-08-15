@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import C from "../renderer/core.cjs";
+import C from "../renderer/core.js";
 
 const fresh = () => ({ phase: "idle", tool: null, label: null, todos: [] });
 

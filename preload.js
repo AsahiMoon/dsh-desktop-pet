@@ -9,6 +9,10 @@ contextBridge.exposeInMainWorld("petAPI", {
   ready: () => ipcRenderer.invoke("pet:ready"),
   /** Resolve current { config, roles } (config + installed characters). */
   getConfig: () => ipcRenderer.invoke("pet:get-config"),
+  /** Resolve the characters/config folder paths (settings panel). */
+  getPaths: () => ipcRenderer.invoke("pet:paths"),
+  /** Open a folder in the OS file manager ("characters" | "config"). */
+  openPath: (which) => ipcRenderer.send("pet:open-path", which),
   /** Ask the main process to move the window by a mouse delta (dip). */
   moveTo: (dx, dy) => ipcRenderer.send("pet:move-to", dx, dy),
   /** Capture the window position as the drag anchor (also cancels any walk). */

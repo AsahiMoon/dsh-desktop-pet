@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import C from "../renderer/core.cjs";
+import C from "../renderer/core.js";
 
 const NOW = new Date(2026, 7, 15, 23, 45).getTime(); // 23:45
 

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import C from "../renderer/core.cjs";
+import C from "../renderer/core.js";
 
 describe("syncNextState (heartbeat transitions)", () => {
   it("exec wakes from ANY sleep (natural nap or post-work rest)", () => {
