@@ -1,0 +1,21 @@
+# dependencies
+node_modules/
+
+# build output (electron-builder)
+dist/
+*.blockmap
+
+# logs & runtime debug
+*.log
+.menu-*
+menu-debug.jsonl
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# npm pack leftovers
+*.tgz

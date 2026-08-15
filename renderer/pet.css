@@ -1,0 +1,183 @@
+/* dsh-desktop-pet — renderer styles. The window itself is transparent; only
+   the pet sprite, bubble, status bar and menu are painted. */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: transparent;
+  user-select: none;
+  cursor: default;
+}
+
+#stage {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Pet area: an EXACT square (size x size) anchored at the window's TOP-LEFT
+   (the window is wider — extra room on the right hosts a wide flat info box).
+   --pet-size is set from config by the renderer. */
+#pet {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: var(--pet-size, 110px);
+  aspect-ratio: 1 / 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* Sprite frame player: #sprite is the viewport; #sprite-inner is N frames wide
+   and animates transform: translateX to step through them (compositor-driven,
+   reliable even when the window is unfocused). */
+#sprite {
+  width: 100%;
+  height: 100%;
+  position: relative;
+  overflow: hidden;
+  pointer-events: none; /* mouse events handled on #pet for drag detection */
+}
+#sprite-inner {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 100%;
+  background-repeat: no-repeat;
+  background-position: 0 0;
+  will-change: transform;
+}
+/* motion animations are JS-driven (see pet.js MOTION_DEFS); transform on #stage */
+
+/* bubble (one-line status text) — caption style, lives in the bottom strip,
+   left-aligned under the pet, extending into the extra room on the right */
+#bubble {
+  position: absolute;
+  left: 0;
+  top: calc(100% - 52px + 4px);
+  max-width: calc(100% - 12px);
+  padding: 3px 10px;
+  border-radius: 10px;
+  background: rgba(20, 24, 44, 0.82);
+  color: #eafffa;
+  font: 12px/1.5 "Microsoft YaHei", sans-serif;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+
+/* status bar — the black info box below the pet (hover summary / persistent
+   task progress), styled after the original whale-girl message box: wide and
+   flat (up to 2 lines), left-aligned under the pet. */
+#statusbar {
+  position: absolute;
+  left: 0;
+  top: calc(100% - 52px + 3px);
+  max-width: calc(100% - 8px);
+  min-width: 40px;
+  max-height: 38px;
+  overflow: hidden;
+  padding: 2px 8px;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.78);
+  color: #fff;
+  font: 11px/1.5 "Microsoft YaHei", sans-serif;
+  text-align: left;
+  white-space: normal;
+  pointer-events: none;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.35);
+}
+
+.hidden { display: none !important; }
+
+/* settings window mode (separate BrowserWindow with ?settings=1) */
+body[data-settings] {
+  background: #141426;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+body[data-settings] #stage {
+  width: auto;
+  height: auto;
+}
+
+/* settings panel */
+#settings {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 190px;
+  padding: 10px 14px;
+  border-radius: 12px;
+  background: rgba(16, 20, 38, 0.92);
+  color: #eafffa;
+  font: 13px/1.8 "Microsoft YaHei", sans-serif;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  z-index: 20;
+}
+#settings .settings-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+  text-align: center;
+}
+#settings label {
+  display: block;
+  margin: 6px 0;
+}
+#settings input[type="range"] {
+  width: 100%;
+  accent-color: #39c5bb;
+}
+#settings select {
+  width: 100%;
+  padding: 3px 6px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(57, 197, 187, 0.18);
+  color: #eafffa;
+  font: 13px "Microsoft YaHei", sans-serif;
+}
+#settings select option {
+  background: #141426;
+  color: #eafffa;
+}
+#settings button {
+  margin-top: 6px;
+  width: 100%;
+  padding: 4px 0;
+  border: none;
+  border-radius: 8px;
+  background: rgba(57, 197, 187, 0.3);
+  color: #eafffa;
+  cursor: pointer;
+}
+#settings button:hover { background: rgba(57, 197, 187, 0.5); }
+#settings .check-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 6px 0;
+  cursor: pointer;
+}
+#settings input[type="checkbox"] {
+  width: auto;
+  accent-color: #39c5bb;
+}
+
+/* entry pop animation */
+#stage.enter #sprite { animation: pop-in 0.4s ease-out; }
+@keyframes pop-in {
+  from { transform: scale(0.6); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}

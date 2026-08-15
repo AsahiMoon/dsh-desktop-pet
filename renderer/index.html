@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self' pet:; style-src 'self' 'unsafe-inline'; img-src 'self' pet: data:; script-src 'self'" />
+  <title>dsh-desktop-pet</title>
+  <link rel="stylesheet" href="pet.css" />
+</head>
+<body>
+  <div id="stage">
+    <div id="pet">
+      <div id="sprite" aria-hidden="true"></div>
+    </div>
+    <div id="bubble" class="hidden"></div>
+    <div id="statusbar" class="hidden"></div>
+    <div id="settings" class="hidden" role="dialog">
+      <div class="settings-title">⚙️ 设置</div>
+      <label>角色 <select id="character-select"></select></label>
+      <label>大小 <span id="size-value"></span>px
+        <input id="size-range" type="range" min="64" max="256" step="4" />
+      </label>
+      <label>透明度 <span id="opacity-value"></span>
+        <input id="opacity-range" type="range" min="20" max="100" step="2" />
+      </label>
+      <label class="check-row"><input id="task-bar-persistent" type="checkbox" /> 常驻显示任务进度</label>
+      <label class="check-row"><input id="task-bar-detailed" type="checkbox" /> 详细进度（显示最近完成的任务）</label>
+      <button id="settings-close">完成</button>
+    </div>
+  </div>
+  <script src="pet.js"></script>
+</body>
+</html>
