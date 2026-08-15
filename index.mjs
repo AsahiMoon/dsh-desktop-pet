@@ -174,6 +174,9 @@ export function apply(ctx) {
   let waiting = false;
   let activeTools = 0;
   let lastTodo = [];
+  // tool arguments arrive as STREAMING chunks (argumentsDelta fragments keyed by
+  // callId) — accumulate them so the pet can show the tool's actual target
+  const toolArgs = new Map();
 
   // When several sessions exist (multiple agents in the web UI), concurrent
   // sessions would fight over the pet's one state box. Only the MOST RECENTLY
@@ -235,6 +238,29 @@ export function apply(ctx) {
   };
   const toolLabel = (name) => TOOL_LABELS[name] ?? `🛠️ ${name}`;
 
+  /** Short human-readable target of a tool call (file path / query / command…)
+   *  for the pet's detailed caption. Null when the tool has nothing useful. */
+  const toolDetailOf = (name, args) => {
+    if (!args || typeof args !== "object") return null;
+    const KEY = {
+      read: "file_path", write: "file_path", edit: "file_path", read_image: "file_path",
+      glob: "pattern", grep: "pattern", pwsh: "command", web_search: "query",
+      skill: "name", subagent: "description", subagent_fork: "description",
+      job_output: "job_id", workflow: "name",
+    };
+    const key = KEY[name];
+    const picked = key && typeof args[key] === "string" && args[key].trim() ? args[key].trim() : null;
+    if (picked) return picked.length > 60 ? picked.slice(0, 60) : picked;
+    // generic fallback: first non-empty string argument value
+    for (const val of Object.values(args)) {
+      if (typeof val === "string" && val.trim()) {
+        const s = val.trim();
+        return s.length > 60 ? s.slice(0, 60) : s;
+      }
+    }
+    return null;
+  };
+
   const disposers = [
     // Task terminal states: completed -> celebrate, failed -> error.
     ctx.jobs.onJobDone((snapshot) => {
@@ -277,12 +303,30 @@ export function apply(ctx) {
           sendSignal({ type: "celebrate", label: "回合完成" });
         }
       } else if (type === "tool/call") {
-        // the model asked for a tool — show what it is doing (codex-pet style)
+        // the model asked for a tool — show what it is doing (codex-pet style).
+        // tool/call events are STREAMING chunks: { chunk: { id, name?, argumentsDelta } },
+        // so accumulate the argument fragments and attach the parsed target.
         activeTools++;
-        const name = event?.data?.name;
-        sendSignal({ type: "exec", tool: name, label: toolLabel(name) });
+        const chunk = event?.data?.chunk ?? {};
+        const name = event?.data?.name ?? chunk.name;
+        const callId = event?.data?.callId ?? chunk.id;
+        if (chunk.argumentsDelta && callId) {
+          toolArgs.set(callId, (toolArgs.get(callId) ?? "") + chunk.argumentsDelta);
+          if (toolArgs.size > 64) toolArgs.clear(); // guard against leaked calls
+        }
+        let detail = null;
+        if (name && callId && toolArgs.has(callId)) {
+          try {
+            detail = toolDetailOf(name, JSON.parse(toolArgs.get(callId)));
+          } catch {
+            /* partial JSON mid-stream — keep the previous detail */
+          }
+        }
+        sendSignal({ type: "exec", tool: name, label: toolLabel(name), detail });
       } else if (type === "tool/result") {
         activeTools = Math.max(0, activeTools - 1);
+        const callId = event?.data?.message?.source?.callId ?? event?.data?.callId;
+        if (callId) toolArgs.delete(callId);
         if (activeTools === 0) sendSignal({ type: "tool-done" });
       } else if (type === "todo/write") {
         // progress snapshot: [{ content, status }]

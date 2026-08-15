@@ -65,6 +65,9 @@ function applyTaskSignal(taskState, signal, taskHistory, runHistory) {
       taskState.phase = "exec";
       taskState.tool = signal.tool ?? null;
       taskState.label = signal.label ?? null;
+      // what the tool is ACTUALLY doing — file path / query / command (the
+      // pet's detailed caption shows it; bundled as `detail` by the Node half)
+      taskState.detail = signal.detail ?? null;
       noteRun(runHistory, signal.tool, signal.label);
       break;
     case "todo": {
@@ -100,9 +103,11 @@ function applyTaskSignal(taskState, signal, taskHistory, runHistory) {
       break;
     case "idle":
       if (taskState.phase !== "exec") taskState.phase = "idle";
+      taskState.detail = null;
       break;
     case "welcome":
       taskState.phase = "welcome";
+      taskState.detail = null;
       break;
     case "sync": {
       if (Array.isArray(signal.todos)) taskState.todos = signal.todos;
@@ -111,6 +116,7 @@ function applyTaskSignal(taskState, signal, taskHistory, runHistory) {
       else if (signal.wait) taskState.phase = "wait";
       else if (taskState.phase === "exec" || taskState.phase === "think" || taskState.phase === "wait") {
         taskState.phase = "idle";
+        taskState.detail = null; // no longer executing — drop the stale target
       }
       break;
     }
@@ -167,7 +173,11 @@ function taskNote(taskState, state) {
       : taskState.label
         ? String(taskState.label).slice(0, 10)
         : "";
-    return [phase ? phase.replace(/\s+$/, "") : null, tool].filter(Boolean).join(" ") || "工作中";
+    const base = [phase ? phase.replace(/\s+$/, "") : null, tool].filter(Boolean).join(" ") || "工作中";
+    // the actual target of the running tool (file path / query / command…)
+    const detail =
+      taskState.phase === "exec" && taskState.detail ? String(taskState.detail).slice(0, 22) : null;
+    return detail ? `${base} · ${detail}` : base;
   }
   return "空闲中";
 }
@@ -209,7 +219,11 @@ function detailedText(ctx) {
     const todos = currentTodos ?? [];
     const done = todos.filter((t) => t.status === "completed").length;
     const active = todos.find((t) => t.status === "in_progress");
-    if (todos.length) {
+    if (taskState.phase === "exec" && taskState.detail) {
+      // what the tool is actually doing takes priority over the todo list:
+      // 📎 the file path / query / command it was called with
+      lines.push(`📎 ${String(taskState.detail).slice(0, 30)}`);
+    } else if (todos.length) {
       const doneItems = todos.filter((t) => t.status === "completed").map((t) => String(t.content).slice(0, 6));
       lines.push(
         `📋 ${done}/${todos.length}${active ? " 正在" + String(active.content).slice(0, 8) : ""}${doneItems.length ? " ✅" + doneItems.slice(-2).join(" ✅") : ""}`,

@@ -13,6 +13,16 @@ describe("applyTaskSignal", () => {
     expect(runs).toEqual(["pwsh"]);
   });
 
+  it("stores the tool's detail (file path / command) and clears it on idle", () => {
+    const ts = fresh();
+    C.applyTaskSignal(ts, { type: "exec", tool: "read", label: "📖 读文件", detail: "F:\\a\\b.js" }, [], []);
+    expect(ts.detail).toBe("F:\\a\\b.js");
+    // sync heartbeat with no activity relaxes to idle and drops the detail
+    C.applyTaskSignal(ts, { type: "sync", exec: false, think: false, wait: false, todos: [] }, [], []);
+    expect(ts.phase).toBe("idle");
+    expect(ts.detail).toBeNull();
+  });
+
   it("drops generic round-complete labels from the completed history", () => {
     const hist = [];
     C.applyTaskSignal(fresh(), { type: "celebrate", label: "回合完成" }, hist, []);

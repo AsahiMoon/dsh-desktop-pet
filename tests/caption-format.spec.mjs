@@ -56,6 +56,32 @@ describe("detailedText", () => {
     expect(text).toContain("✅");
   });
 
+  it("shows the tool's actual target (file path) in the detailed view", () => {
+    const text = C.detailedText({
+      ...base,
+      taskState: { phase: "exec", tool: "read", label: "📖 读文件", detail: "F:\\AI_workspace\\src\\main.js", todos: [] },
+    });
+    expect(text).toContain("[23:45] 🛠️ 执行中 · read");
+    expect(text).toContain("📎 F:\\AI_workspace\\src\\main.js");
+  });
+
+  it("brief view appends the target to the tool note", () => {
+    const text = C.hoverText({
+      ...base,
+      taskState: { phase: "exec", tool: "pwsh", label: "", detail: "npm test", todos: [] },
+    });
+    expect(text).toBe("[23:45] 🛠️ 执行中 pwsh · npm test");
+  });
+
+  it("stale detail is not shown outside the exec phase", () => {
+    const text = C.detailedText({
+      ...base,
+      taskState: { phase: "think", tool: "read", label: "", detail: "F:\\old\\path.js", todos: [] },
+    });
+    expect(text).not.toContain("📎");
+    expect(text).not.toContain("old\\path");
+  });
+
   it("idle shows the executed tools, fallback to completed tasks", () => {
     expect(C.detailedText({ ...base, runHistory: ["pwsh", "read_file"] })).toBe(
       "[23:45] 空闲中\n🛠️ 已执行：read_file · pwsh",
