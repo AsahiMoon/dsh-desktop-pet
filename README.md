@@ -125,8 +125,14 @@ exe 独立版直接编辑 `%APPDATA%/dsh-desktop-pet/config.json`，保存即热
 
 宠物在 **两个角色目录** 中自动发现角色：
 
-1. `assets/characters/<id>/` —— 随包内置（只读）
-2. `%APPDATA%/dsh-desktop-pet/characters/<id>/` —— **运行时写入**，兼容一切新模型
+1. `%APPDATA%/dsh-desktop-pet/characters/<id>/` —— **统一管理目录**（运行时写入）：
+   内置角色（鲸鱼娘）会在**首次启动时自动复制进来**，与 petdex 导入、手动放入的角色
+   放在一起，打开文件夹就能看到、能改、能删
+2. `assets/characters/<id>/` —— 随包内置（只读，用户目录里没有时才作为兜底）
+
+> 内置角色是**复制即管理**：想改鲸鱼娘的素材，直接编辑
+> `characters/whale-girl/` 里的文件即可（用户目录优先）。删掉文件夹会在下次启动时
+> 还原（相当于"恢复默认"）；想彻底移除，在 `.ignore` 里写一行 `whale-girl`。
 
 添加角色的方式：
 
@@ -145,8 +151,8 @@ npx petdex install <宠物名>        # ① petdex 生态：启动时自动导�
 其他说明：
 
 - 角色名读取自 manifest / pet.json；设置面板角色下拉会标注来源（`· Codex`）
-- 不想自动导入的角色：在 `characters/.ignore` 里每行写一个 id
-- 删除角色：删掉 `characters/<id>/` 文件夹
+- 不想自动导入/还原的角色：在 `characters/.ignore` 里每行写一个 id
+- 删除角色：删掉 `characters/<id>/` 文件夹（内置角色会随下次启动还原，除非写进 `.ignore`）
 - 角色素材版权归原作者，随包分发请自行确认许可（本项目内置 whale-girl 为 MIT）
 
 ## 🖱️ 交互

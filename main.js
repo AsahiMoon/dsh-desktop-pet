@@ -36,7 +36,8 @@ const ROOT = __dirname;
 // `npx petdex install <name>` — it shows up in the character list.
 const CHARACTERS_DIR = path.join(ROOT, "assets", "characters");
 const USER_CHARACTERS_DIR = () => path.join(app.getPath("userData"), "characters");
-/** Characters to NEVER auto-import from petdex (user deletions). One id per line. */
+/** Characters to NEVER auto-import (petdex OR built-in sync — user deletions).
+ *  One id per line in userData/characters/.ignore. */
 const IGNORE_FILE = () => path.join(app.getPath("userData"), "characters", ".ignore");
 
 // Pin the userData directory to the app name regardless of how electron is
@@ -223,8 +224,18 @@ function forceNoTaskbar(win) {
   }
 }
 
+/** Resolve a character asset, user dir FIRST (the writable copy is the source
+ *  of truth after syncBuiltinCharacters; the asar copy is the fallback). */
+function characterAsset(id, file) {
+  for (const base of [USER_CHARACTERS_DIR(), CHARACTERS_DIR]) {
+    const p = path.join(base, id, file);
+    if (fs.existsSync(p)) return p;
+  }
+  return path.join(CHARACTERS_DIR, id, file);
+}
+
 /** Window icon: whale-girl idle frame (nativeImage accepts the PNG directly). */
-const WINDOW_ICON = () => path.join(CHARACTERS_DIR, "whale-girl", "idle.png");
+const WINDOW_ICON = () => characterAsset("whale-girl", "idle.png");
 
 function applyBottomMode(enabled) {
   if (!win || win.isDestroyed()) return;
@@ -410,6 +421,21 @@ function inspectCharacter(id, dir) {
   return null;
 }
 
+/** Parse the .ignore list (ids the user never wants auto-copied). */
+function readIgnoreFile() {
+  try {
+    return new Set(
+      fs
+        .readFileSync(IGNORE_FILE(), "utf8")
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+  } catch {
+    return new Set(); /* no ignore file */
+  }
+}
+
 /**
  * Import runtime characters from `npx petdex install` (respecting .ignore).
  * Folders placed directly into the user characters dir are picked up by
@@ -421,18 +447,7 @@ function importExternalCharacters() {
   } catch {
     /* best-effort */
   }
-  let ignore = new Set();
-  try {
-    ignore = new Set(
-      fs
-        .readFileSync(IGNORE_FILE(), "utf8")
-        .split(/\r?\n/)
-        .map((s) => s.trim())
-        .filter(Boolean),
-    );
-  } catch {
-    /* no ignore file */
-  }
+  const ignore = readIgnoreFile();
   const known = new Set(scanCharacters().map((c) => c.id));
   try {
     const petdexDir = path.join(os.homedir(), ".petdex", "pets");
@@ -451,6 +466,64 @@ function importExternalCharacters() {
     }
   } catch {
     /* no petdex dir */
+  }
+}
+
+/**
+ * Recursive copy that works with ASAR sources. fs.cpSync / fs.copyFileSync use
+ * the native uv_fs_copyfile path which is NOT patched by Electron's asar
+ * layer, so copying OUT of the packaged app.asar silently produces an empty
+ * directory. readFileSync / writeFileSync ARE asar-aware, so drive the copy
+ * through them instead.
+ */
+function copyDirRecursive(src, dest) {
+  fs.mkdirSync(dest, { recursive: true });
+  for (const e of fs.readdirSync(src, { withFileTypes: true })) {
+    const s = path.join(src, e.name);
+    const d = path.join(dest, e.name);
+    if (e.isDirectory()) copyDirRecursive(s, d);
+    else fs.writeFileSync(d, fs.readFileSync(s));
+  }
+}
+
+/**
+ * Sync the BUILT-IN characters (whale-girl) into the writable user characters
+ * dir so EVERY character lives in one place — the user opens the folder and
+ * sees whale-girl next to the imported ones, can replace its art, or delete
+ * it. The built-in asar copy stays as a read-only fallback (user dir wins on
+ * conflict, see scanCharacters / resolveCharacterFile).
+ *
+ * Copy-if-missing semantics: a missing folder is re-copied on the next boot
+ * (acts as a "reset to default"); to remove a built-in permanently, add its
+ * id to .ignore.
+ */
+function syncBuiltinCharacters() {
+  let builtins = [];
+  try {
+    builtins = fs
+      .readdirSync(CHARACTERS_DIR, { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name);
+  } catch {
+    return; /* built-in dir unreadable (shouldn't happen inside asar) */
+  }
+  if (!builtins.length) return;
+  try {
+    fs.mkdirSync(USER_CHARACTERS_DIR(), { recursive: true });
+  } catch {
+    return;
+  }
+  const ignore = readIgnoreFile();
+  for (const id of builtins) {
+    if (ignore.has(id)) continue;
+    const dest = path.join(USER_CHARACTERS_DIR(), id);
+    if (fs.existsSync(dest)) continue;
+    try {
+      copyDirRecursive(path.join(CHARACTERS_DIR, id), dest);
+      console.log(`[pet] built-in character '${id}' copied to user characters dir`);
+    } catch {
+      /* best-effort */
+    }
   }
 }
 
@@ -671,10 +744,10 @@ function createWindow() {
 // tray
 // ---------------------------------------------------------------------------
 function trayIcon() {
-  // always use the built-in whale-girl art: codex characters have no
-  // idle.png, and createFromPath silently returns an EMPTY image for
-  // missing files — an invisible tray icon.
-  const png = path.join(CHARACTERS_DIR, "whale-girl", "idle.png");
+  // always use whale-girl art: codex characters have no idle.png, and
+  // createFromPath silently returns an EMPTY image for missing files — an
+  // invisible tray icon. Resolves the user copy first (customized art wins).
+  const png = characterAsset("whale-girl", "idle.png");
   try {
     return nativeImage.createFromPath(png).resize({ width: 16, height: 16 });
   } catch {
@@ -1045,6 +1118,7 @@ if (!gotLock) {
     if (process.platform === "darwin" && app.dock?.hide) app.dock.hide();
     loadConfig();
     importExternalCharacters(); // petdex pets -> userData/characters
+    syncBuiltinCharacters(); // whale-girl -> userData/characters (统一管理)
     registerPetProtocol();
     setupIpc();
     startSignalServer();
