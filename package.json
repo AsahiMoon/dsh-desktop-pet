@@ -15,7 +15,8 @@
   "scripts": {
     "start": "electron main.js",
     "dev": "electron main.js --dev",
-    "check": "node --check main.js && node --check index.mjs && node --check config.mjs",
+    "check": "node --check main.js && node --check index.mjs && node --check config.mjs && node --check renderer/core.cjs",
+    "test": "vitest run",
     "dist": "electron-builder --win",
     "dist:portable": "electron-builder --win portable",
     "smoke:menu": "node scripts/smoke/smoke-menu.cjs",
@@ -70,7 +71,8 @@
   },
   "devDependencies": {
     "electron": "^33.0.0",
-    "electron-builder": "^26.15.3"
+    "electron-builder": "^26.15.3",
+    "vitest": "^4.1.10"
   },
   "build": {
     "appId": "com.dsh.desktop-pet",

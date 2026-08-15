@@ -25,6 +25,9 @@ jobs:
       - name: Syntax check
         run: npm run check
 
+      - name: Unit tests
+        run: npm test
+
       - name: Package (nsis + portable)
         run: npm run dist
 

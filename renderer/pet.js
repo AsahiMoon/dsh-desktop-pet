@@ -24,6 +24,7 @@ const DEFAULT_CONFIG = Object.freeze({
   sleepAfterMs: 60000,
   taskBarPersistent: false,
   taskBarDetailed: false,
+  hideWhenIdle: false,
 });
 
 const TICK_ACTIVE_MS = 60_000; // +1 xp per minute of company
@@ -53,6 +54,7 @@ const opacityRange = document.getElementById("opacity-range");
 const opacityValue = document.getElementById("opacity-value");
 const taskBarPersistentInput = document.getElementById("task-bar-persistent");
 const taskBarDetailedInput = document.getElementById("task-bar-detailed");
+const hideWhenIdleInput = document.getElementById("hide-when-idle");
 
 // runtime config (merged defaults + signal/file config)
 let CONFIG = { ...DEFAULT_CONFIG, walk: { ...DEFAULT_CONFIG.walk } };
@@ -89,8 +91,14 @@ function applyConfig(cfg) {
   if (!cfg || typeof cfg !== "object") return;
   const next = { ...CONFIG, ...cfg, walk: { ...CONFIG.walk, ...(cfg.walk ?? {}) } };
   const characterChanged = next.character !== CONFIG.character;
+  const hideToggled = cfg.hideWhenIdle !== undefined && cfg.hideWhenIdle !== CONFIG.hideWhenIdle;
   CONFIG = next;
   document.body.style.setProperty("--pet-size", `${CONFIG.size}px`);
+  if (hideToggled) {
+    // live toggle: apply hide immediately if already in the long-quiet sleep
+    if (CONFIG.hideWhenIdle && state === "sleep" && naturalSleep) hidePet();
+    else if (!CONFIG.hideWhenIdle) showPet();
+  }
   if (characterChanged && next.character) {
     loadCharacter(next.character);
   }
@@ -571,6 +579,7 @@ function fillSettingsValues() {
   opacityValue.textContent = `${Math.round(CONFIG.opacity * 100)}%`;
   if (taskBarPersistentInput) taskBarPersistentInput.checked = !!CONFIG.taskBarPersistent;
   if (taskBarDetailedInput) taskBarDetailedInput.checked = !!CONFIG.taskBarDetailed;
+  if (hideWhenIdleInput) hideWhenIdleInput.checked = !!CONFIG.hideWhenIdle;
 }
 function openSettings() {
   // pet window: just open the separate settings window
@@ -607,6 +616,11 @@ if (taskBarDetailedInput) {
     window.petAPI.setConfig({ taskBarDetailed: taskBarDetailedInput.checked });
   });
 }
+if (hideWhenIdleInput) {
+  hideWhenIdleInput.addEventListener("change", () => {
+    window.petAPI.setConfig({ hideWhenIdle: hideWhenIdleInput.checked });
+  });
+}
 
 // ---------------------------------------------------------------------------
 // interactivity: LEFT drag to move; RIGHT click opens the native menu
@@ -628,6 +642,7 @@ petEl.addEventListener("mousedown", (e) => {
   // but the delta between two screenX values is exact.
   drag = { startScreenX: e.screenX, startScreenY: e.screenY, moved: false };
   window.petAPI.dragStart();
+  showPet();
   e.preventDefault();
 });
 
@@ -725,82 +740,26 @@ function renderCaption() {
   }
 }
 
-/** [HH:MM] — same timestamp style as the original whale-girl's memory notes. */
-function fmtTime(ts = Date.now()) {
-  const d = new Date(ts);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+/** Caption text — pure formatting delegated to core.cjs (unit-tested). */
+function captionCtx() {
+  return {
+    taskState,
+    currentTodos,
+    taskHistory,
+    runHistory,
+    state,
+    detailed: !!CONFIG.taskBarDetailed,
+    now: Date.now(),
+  };
 }
-
-/** Hover summary — abbreviated, referencing the original whale-girl status
- *  card: a [HH:MM] note + short status (no growth stats). Wide flat box. */
 function statusTextHover() {
-  const lines = [];
-  let note;
-  if (state === "sleep") {
-    note = "💤 睡觉中";
-  } else if (taskState.phase !== "idle" && taskState.phase !== "welcome") {
-    const phase = TASK_PHASE_TEXT[taskState.phase];
-    const tool = taskState.tool
-      ? String(taskState.tool).slice(0, 10)
-      : taskState.label
-        ? String(taskState.label).slice(0, 10)
-        : "";
-    note = [phase ? phase.replace(/\s+$/, "") : null, tool].filter(Boolean).join(" ") || "工作中";
-  } else {
-    note = "空闲中";
-  }
-  lines.push(`[${fmtTime()}] ${note}`);
-  const done = currentTodos.filter((t) => t.status === "completed").length;
-  if (currentTodos.length) {
-    const active = currentTodos.find((t) => t.status === "in_progress");
-    lines.push(`📋 ${done}/${currentTodos.length}${active ? " · " + String(active.content).slice(0, 10) : ""}`);
-  }
-  return lines.join("\n");
+  return C.hoverText(captionCtx());
 }
-
-/** Persistent task progress: brief (same compact style as hover) or detailed
- *  (current run specifics + completed steps + executed tools). */
 function statusTextPersist() {
-  if (CONFIG.taskBarDetailed) return statusTextDetailed();
-  return statusTextHover();
+  return C.persistText(captionCtx());
 }
-
-/** Detailed view — what is actually running: time + phase/tool, todo progress
- *  with the active step and completed steps, or the executed tools when idle. */
 function statusTextDetailed() {
-  const lines = [];
-  if (state === "sleep") {
-    lines.push(`[${fmtTime()}] 💤 睡觉中`);
-  } else if (taskState.phase !== "idle" && taskState.phase !== "welcome") {
-    const head = [
-      TASK_PHASE_TEXT[taskState.phase]?.replace(/\s+$/, ""),
-      taskState.tool ? String(taskState.tool).slice(0, 10) : taskState.label ? String(taskState.label).slice(0, 12) : null,
-    ].filter(Boolean);
-    lines.push(`[${fmtTime()}] ${head.join(" · ")}`);
-    const done = currentTodos.filter((t) => t.status === "completed").length;
-    const active = currentTodos.find((t) => t.status === "in_progress");
-    if (currentTodos.length) {
-      const doneItems = currentTodos
-        .filter((t) => t.status === "completed")
-        .map((t) => String(t.content).slice(0, 6));
-      lines.push(
-        `📋 ${done}/${currentTodos.length}${active ? " 正在" + String(active.content).slice(0, 8) : ""}${doneItems.length ? " ✅" + doneItems.slice(-2).join(" ✅") : ""}`,
-      );
-    } else if (taskState.label) {
-      lines.push(`🛠️ ${String(taskState.label).slice(0, 22)}`);
-    }
-  } else {
-    lines.push(`[${fmtTime()}] 空闲中`);
-    const runs = runHistory.slice(-3).reverse();
-    if (runs.length) {
-      lines.push(`🛠️ 已执行：${runs.join(" · ")}`);
-    } else {
-      const done = taskHistory.slice(-2).reverse();
-      if (done.length) lines.push(`✅ 已完成：${done.join(" · ")}`);
-    }
-  }
-  return lines.join("\n");
+  return C.detailedText(captionCtx());
 }
 
 // task-progress snapshot from the agent's todo list (todo/write events)
@@ -817,8 +776,31 @@ function tickIdle() {
   if (!statusbarEl.classList.contains("hidden")) renderCaption();
   if (busy || state !== "idle") return;
   if (Date.now() - lastInteractAt >= CONFIG.sleepAfterMs) {
+    naturalSleep = true;
     setState("sleep");
     bubble("💤 打个盹…");
+    if (CONFIG.hideWhenIdle) hidePet(); // long-quiet sleep -> hide the window
+  }
+}
+
+// hideWhenIdle: hide the pet entirely during its long-quiet sleep, reappear
+// on any real activity (DSH signals / click / drag). `naturalSleep` tells the
+// long-quiet sleep apart from the brief post-work nap (which stays visible).
+let naturalSleep = false;
+let petHidden = false;
+function hidePet() {
+  if (petHidden) return;
+  petHidden = true;
+  if (window.petAPI && typeof window.petAPI.setWindowVisible === "function") {
+    window.petAPI.setWindowVisible(false);
+  }
+}
+function showPet() {
+  naturalSleep = false;
+  if (!petHidden) return;
+  petHidden = false;
+  if (window.petAPI && typeof window.petAPI.setWindowVisible === "function") {
+    window.petAPI.setWindowVisible(true);
   }
 }
 
@@ -848,6 +830,7 @@ const CLICK_LINES = ["呀！", "嘿嘿~", "♪", "在呢在呢！", "戳我干�
 petEl.addEventListener("click", (e) => {
   if (pierceMode) return;
   if (settingsEl.contains(e.target)) return;
+  showPet(); // clicking always brings the pet back
   if (lastDragWasMove) {
     lastDragWasMove = false;
     return;
@@ -872,102 +855,22 @@ petEl.addEventListener("click", (e) => {
 // ---------------------------------------------------------------------------
 // DSH agent-state sync (signals pushed over HTTP by the bundle Node half)
 // ---------------------------------------------------------------------------
+// Pure logic (task tracking / transitions / caption text) lives in core.cjs
+// so it is unit-testable; pet.js wires it to the DOM + state machine.
+const C = window.PetCore;
+
 // Current-task info snapshot, maintained from signals and rendered in the
 // black info box below the pet (hover or persistent).
 let taskState = { phase: "idle", tool: null, label: null, todos: [] };
 
-// Recently completed tasks (from todo transitions + celebrate labels) and
-// recently executed tools (from exec signals) — shown in the detailed view.
-// Generic round-complete labels ("回合完成" fires on EVERY turn/end) carry no
-// information and would flood the list — only meaningful entries are kept,
-// and consecutive duplicates are collapsed.
-const GENERIC_TASK_LABELS = new Set(["回合完成", "任务完成", "任务失败", "请求出错"]);
+// Recently completed tasks + executed tools — shown in the detailed view.
 let taskHistory = [];
 let runHistory = [];
-function noteCompletedTask(text) {
-  if (!text) return;
-  const t = String(text).slice(0, 18);
-  if (GENERIC_TASK_LABELS.has(t)) return;
-  if (taskHistory[taskHistory.length - 1] === t) return; // consecutive dedupe
-  taskHistory.push(t);
-  if (taskHistory.length > 6) taskHistory.shift();
-}
-function noteRun(tool, label) {
-  const t = (tool ?? label ?? "").toString().slice(0, 12);
-  if (!t) return;
-  if (runHistory[runHistory.length - 1] === t) return; // consecutive dedupe
-  runHistory.push(t);
-  if (runHistory.length > 8) runHistory.shift();
-}
 
 function trackTaskSignal(signal) {
-  switch (signal.type) {
-    case "exec":
-      taskState.phase = "exec";
-      taskState.tool = signal.tool ?? null;
-      taskState.label = signal.label ?? null;
-      noteRun(signal.tool, signal.label);
-      break;
-    case "todo": {
-      if (Array.isArray(signal.todos)) {
-        const prev = new Map((taskState.todos ?? []).map((t) => [t.content, t.status]));
-        taskState.todos = signal.todos;
-        for (const t of signal.todos) {
-          if (t.status === "completed" && prev.get(t.content) !== "completed") {
-            noteCompletedTask(t.content);
-          }
-        }
-      }
-      break;
-    }
-    case "celebrate":
-      taskState.phase = "done";
-      taskState.label = signal.label ?? null;
-      if (signal.label) noteCompletedTask(signal.label);
-      break;
-    case "error":
-      taskState.phase = "error";
-      taskState.label = signal.label ?? null;
-      break;
-    case "think":
-      if (taskState.phase !== "exec") taskState.phase = "think";
-      break;
-    case "working":
-      taskState.phase = "exec";
-      if (signal.label) taskState.label = signal.label;
-      break;
-    case "wait":
-      if (taskState.phase !== "exec") taskState.phase = "wait";
-      break;
-    case "idle":
-      if (taskState.phase !== "exec") taskState.phase = "idle";
-      break;
-    case "welcome":
-      taskState.phase = "welcome";
-      break;
-    case "sync": {
-      if (Array.isArray(signal.todos)) taskState.todos = signal.todos;
-      if (signal.exec) taskState.phase = "exec";
-      else if (signal.think) taskState.phase = "think";
-      else if (signal.wait) taskState.phase = "wait";
-      else if (taskState.phase === "exec" || taskState.phase === "think" || taskState.phase === "wait") {
-        taskState.phase = "idle";
-      }
-      break;
-    }
-  }
+  C.applyTaskSignal(taskState, signal, taskHistory, runHistory);
   renderCaption(); // live task line under the pet
 }
-
-const TASK_PHASE_TEXT = {
-  idle: "😴 空闲中",
-  think: "💭 思考中…",
-  exec: "🛠️ 执行中",
-  wait: "🕐 等待中…",
-  done: "🎉 已完成",
-  error: "😱 出错了",
-  welcome: "👋 就绪",
-};
 
 function handleSignal(signal) {
   if (!signal || typeof signal.type !== "string") return;
@@ -980,21 +883,10 @@ function handleSignal(signal) {
     // heartbeat state alignment; must NOT refresh lastInteractAt (a 5s
     // heartbeat would otherwise keep the pet awake forever)
     if (Array.isArray(signal.todos)) applyTodos(signal.todos);
-    // exec: show the pet working. Wake from ANY sleep — the natural nap or
-    // the post-work rest — so a new task interrupts the doze; skip a busy walk.
-    if (signal.exec && (state === "sleep" || (!busy && state === "idle"))) {
-      setState("working");
-    } else if (!signal.exec && state === "working") {
-      setState("think");
-    }
-    if (signal.think && (state === "sleep" || (!busy && (state === "idle" || state === "walk")))) {
-      setState("think");
-    } else if (signal.wait && !busy && state === "think") {
-      setState("wait");
-    } else if (!signal.think && !signal.wait && !signal.exec && (state === "think" || state === "working" || state === "wait")) {
-      busy = false;
-      setState("idle");
-    }
+    if (signal.exec || signal.think || signal.wait) showPet(); // real activity
+    const next = C.syncNextState(state, busy, { exec: !!signal.exec, think: !!signal.think, wait: !!signal.wait });
+    if (next === "idle") busy = false;
+    if (next) setState(next);
     return;
   }
   if (signal.type === "pierce") {
@@ -1005,6 +897,9 @@ function handleSignal(signal) {
     return;
   }
   lastInteractAt = Date.now(); // DSH activity keeps the pet awake
+  if (["exec", "working", "think", "wait", "celebrate", "error", "welcome"].includes(signal.type)) {
+    showPet(); // real agent activity brings the pet back
+  }
   switch (signal.type) {
     case "exec":
       // a tool call is running — show what the agent is doing (codex-pet style)

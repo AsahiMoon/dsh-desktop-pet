@@ -95,6 +95,9 @@ dsh-desktop-pet:
     intervalMs: 300000   # 游走间隔（ms）
     durationMs: 26000    # 单次游走时长（ms）
   sleepAfterMs: 60000    # 空闲多久打盹（ms）
+  taskBarPersistent: false  # 任务进度黑框常驻显示
+  taskBarDetailed: false    # 常驻时显示详细进度（已完成步骤 / 已执行工具）
+  hideWhenIdle: false       # 长时间空闲入睡后隐藏宠物窗口（有活动自动出现）
 ```
 
 exe 独立版直接编辑 `%APPDATA%/dsh-desktop-pet/config.json`，保存即热生效。
@@ -139,10 +142,11 @@ npx petdex install <宠物名>        # ① petdex 生态：启动时自动导�
 ## 🛠️ 开发
 
 ```sh
-npm install        # 安装依赖（electron + electron-builder + koffi + schemastery）
+npm install        # 安装依赖（electron + electron-builder + koffi + schemastery + vitest）
 npm start          # 运行宠物窗口（独立模式）
 npm run dev        # 开发模式（附带 DevTools）
 npm run check      # 语法检查
+npm test           # 单元测试（vitest：任务信号跟踪 / 状态机 / 黑框文案）
 npm run dist       # 打包 exe（nsis + portable）
 ```
 

@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld("petAPI", {
   },
   /** Toggle click-through (ignore mouse events). */
   setClickThrough: (enabled) => ipcRenderer.send("pet:click-through", enabled),
+  /** Hide or show the pet window (hideWhenIdle auto-hide). */
+  setWindowVisible: (visible) => ipcRenderer.send("pet:set-window-visible", visible),
   /** Toggle desktop-bottom mode (pin below other windows). */
   setBottomMode: (enabled) => ipcRenderer.send("pet:bottom-mode", !!enabled),
   /** Enlarge the window temporarily for the settings panel. */

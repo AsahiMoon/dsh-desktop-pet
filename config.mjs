@@ -22,6 +22,7 @@ export const DEFAULTS = Object.freeze({
   bottomMode: false, // pin the pet below other windows (desktop wallpaper style)
   taskBarPersistent: false, // keep the task-progress caption always visible
   taskBarDetailed: false, // persistent caption shows detailed progress + completed tasks
+  hideWhenIdle: false, // hide the pet window entirely during its long-quiet sleep
 });
 
 /** schemastery schema for settings.register (defaults mirror DEFAULTS). */
@@ -44,6 +45,7 @@ export function buildSchema() {
     bottomMode: z.boolean().default(DEFAULTS.bottomMode),
     taskBarPersistent: z.boolean().default(DEFAULTS.taskBarPersistent),
     taskBarDetailed: z.boolean().default(DEFAULTS.taskBarDetailed),
+    hideWhenIdle: z.boolean().default(DEFAULTS.hideWhenIdle),
   });
 }
 

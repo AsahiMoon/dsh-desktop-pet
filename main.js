@@ -51,6 +51,7 @@ const DEFAULT_CONFIG = Object.freeze({
   bottomMode: false, // pin the pet below other windows (desktop wallpaper style)
   taskBarPersistent: false, // keep the task-progress caption always visible
   taskBarDetailed: false, // persistent caption shows detailed progress + completed tasks
+  hideWhenIdle: false, // hide the pet window entirely during its long-quiet sleep
 });
 
 // Height of the caption strip below the pet (bubble / statusbar / task
@@ -805,6 +806,17 @@ function setupIpc() {
   });
 
   ipcMain.on("pet:click-through", (_e, enabled) => setClickThrough(enabled));
+
+  // hideWhenIdle: the renderer asks the main process to hide/show the pet
+  ipcMain.on("pet:set-window-visible", (_e, visible) => {
+    if (!win || win.isDestroyed()) return;
+    if (visible) {
+      win.show();
+      forceNoTaskbar(win);
+    } else {
+      win.hide();
+    }
+  });
 
   // click menu: native system popup (no window enlargement needed). The
   // renderer sends the exact action list, derived from the current
