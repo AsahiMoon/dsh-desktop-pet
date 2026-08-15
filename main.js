@@ -768,7 +768,10 @@ function openSettingsWindow() {
   }
   settingsWin = new BrowserWindow({
     width: 300,
-    height: 352,
+    // the panel (title + 角色/大小/透明度 + 3 checkboxes + paths + 完成) needs
+    // ~436 CSS px inside the content area; 500 outer leaves room for the
+    // title bar on every platform (see #settings max-height as a safety net)
+    height: 500,
     title: "DSH Desktop Pet 设置",
     resizable: false,
     minimizable: false,

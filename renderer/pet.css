@@ -118,6 +118,12 @@ body[data-settings] #stage {
   top: 50%;
   transform: translate(-50%, -50%);
   width: 190px;
+  /* safety net: if the content ever outgrows the window (DPI/title-bar
+     differences), scroll inside the panel instead of clipping it. Use the
+     VIEWPORT height — `100%` would resolve against #stage, whose height is
+     auto in settings mode and collapses to 0 */
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 10px 14px;
   border-radius: 12px;
   background: rgba(16, 20, 38, 0.92);
