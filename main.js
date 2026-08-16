@@ -239,8 +239,30 @@ function characterAsset(id, file) {
   return path.join(CHARACTERS_DIR, id, file);
 }
 
-/** Window icon: whale-girl idle frame (nativeImage accepts the PNG directly). */
-const WINDOW_ICON = () => characterAsset("whale-girl", "idle.png");
+/** Crop ONE idle frame (256x256, first of the sprite strip) out of idle.png
+ *  so the tray/window icon shows a single whale-girl instead of the whole
+ *  3-frame sprite strip squashed into the icon box. idle.png is 768x256 —
+ *  frame 0 is x∈[0,256). Falls back to the raw file when cropping fails. */
+function whaleGirlFrameIcon() {
+  const png = characterAsset("whale-girl", "idle.png");
+  try {
+    const img = nativeImage.createFromPath(png);
+    if (img.isEmpty()) return img;
+    const { width, height } = img.getSize();
+    // the sprite strip is 3 square frames side by side; take the first one
+    if (width > height && height > 0) {
+      const frame = img.crop({ x: 0, y: 0, width: Math.min(height, width), height });
+      if (!frame.isEmpty()) return frame;
+    }
+    return img;
+  } catch {
+    /* fall through to raw file */
+  }
+  return nativeImage.createFromPath(png);
+}
+
+/** Window icon: whale-girl idle frame (single cropped frame, not the strip). */
+const WINDOW_ICON = () => whaleGirlFrameIcon();
 
 function applyBottomMode(enabled) {
   if (!win || win.isDestroyed()) return;
@@ -527,7 +549,6 @@ function syncBuiltinCharacters() {
     if (fs.existsSync(dest)) continue;
     try {
       copyDirRecursive(path.join(CHARACTERS_DIR, id), dest);
-      console.log(`[pet] built-in character '${id}' copied to user characters dir`);
     } catch {
       /* best-effort */
     }
@@ -549,7 +570,6 @@ let pendingPoll = null; // { res, timer } parked while the queue is empty
 /** Queue one chat command for the plugin to collect via /poll. */
 function enqueueChatCommand(cmd) {
   chatCommandQueue.push(cmd);
-  console.log(`[pet] chat cmd queued: ${cmd?.cmd}${cmd?.sessionId ? " " + cmd.sessionId : ""}`);
   if (pendingPoll) {
     const { res } = pendingPoll;
     pendingPoll = null;
@@ -565,7 +585,6 @@ function enqueueChatCommand(cmd) {
 function deliverPoll(res) {
   const cmd = chatCommandQueue.shift();
   if (cmd !== undefined) {
-    console.log(`[pet] poll delivered: ${cmd?.cmd}${cmd?.sessionId ? " " + cmd.sessionId : ""}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(cmd));
     return;
@@ -643,13 +662,6 @@ function startSignalServer() {
           return;
         }
         if (signal && typeof signal.type === "string") {
-          if (signal.type === "chat") {
-            const s = signal;
-            console.log(`[pet] signal chat kind=${s?.kind} session=${s?.sessionId ?? ""} rows=${Array.isArray(s?.rows) ? s.rows.length : ""}${s?.failed ? " FAILED" : ""}${s?.follow ? " follow" : ""}`);
-            if (s?.kind === "sessions" && Array.isArray(s?.list)) {
-              console.log(`[pet] sessions list (${s.list.length}): ${s.list.map((x) => `${x.title ?? x.id}${x.preview ? " | " + x.preview : ""}`).join(" ;; ")}`);
-            }
-          }
           broadcast(signal);
           if (win && !win.isDestroyed()) win.setTitle(`dsh-desktop-pet · ${signal.type}`);
           // tray tooltip mirrors meaningful agent states (character base + state)
@@ -668,9 +680,7 @@ function startSignalServer() {
   server.on("error", (err) => {
     console.error("[pet] http server error:", err.message);
   });
-  server.listen(SIGNAL_PORT, SIGNAL_HOST, () => {
-    console.log(`[pet] http signal server listening on ${SIGNAL_HOST}:${SIGNAL_PORT}`);
-  });
+  server.listen(SIGNAL_PORT, SIGNAL_HOST, () => {});
 }
 
 // ---------------------------------------------------------------------------
@@ -814,9 +824,6 @@ function createWindow() {
     win = null;
   });
   win.loadFile(path.join(ROOT, "renderer", "index.html"));
-  win.webContents.on("console-message", (_e, level, message, line, sourceId) => {
-    console.log(`[renderer:${level}] ${message} (${sourceId}:${line})`);
-  });
   win.webContents.on("did-fail-load", (_e, code, desc) => {
     console.error(`[renderer] did-fail-load ${code} ${desc}`);
   });
@@ -847,7 +854,22 @@ function createWindow() {
 function trayIcon() {
   // always use whale-girl art: codex characters have no idle.png, and
   // createFromPath silently returns an EMPTY image for missing files — an
-  // invisible tray icon. Resolves the user copy first (customized art wins).
+  // invisible tray icon. Resolves the user copy first (customized art wins),
+  // then crops to the single idle frame so the tray shows one whale-girl
+  // rather than the squashed 3-frame sprite strip.
+  try {
+    const frame = whaleGirlFrameIcon();
+    if (!frame.isEmpty()) {
+      // Windows tray is 16x16 DIP; 32x32 covers per-monitor DPI scaling.
+      const small = frame.resize({ width: 16, height: 16, quality: "best" });
+      if (process.platform === "win32") {
+        return small.resize({ width: 32, height: 32, quality: "best" });
+      }
+      return small;
+    }
+  } catch {
+    /* fall through to raw */
+  }
   const png = characterAsset("whale-girl", "idle.png");
   try {
     return nativeImage.createFromPath(png).resize({ width: 16, height: 16 });
@@ -1156,9 +1178,6 @@ function openSettingsWindow() {
     settingsWin = null;
   });
   settingsWin.loadFile(path.join(ROOT, "renderer", "index.html"), { query: { settings: "1" } });
-  settingsWin.webContents.on("console-message", (_e, level, message, line, sourceId) => {
-    console.log(`[settings:${level}] ${message} (${sourceId}:${line})`);
-  });
   settingsWin.webContents.setWindowOpenHandler(({ url }) => {
     if (/^https?:\/\//i.test(url)) shell.openExternal(url);
     return { action: "deny" };

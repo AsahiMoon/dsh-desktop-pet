@@ -451,7 +451,6 @@ export function apply(ctx) {
         // (a user-archived conversation stays on disk but is hidden everywhere).
         .filter((entry) => entry.origin !== "subagent" && (entry.delegationDepth ?? 0) <= 0)
         .filter((entry) => !(archivedIds?.has(entry.id) ?? false));
-      console.log(`[dsh-desktop-pet] listSessions: ${byId.size} total ids; archived=${archivedIds ? archivedIds.size : "n/a"}; sorted=${sorted.length} after filter`);
       // persisted entries need a log read for their title/preview — run those
       // reads CONCURRENTLY (bounded pool) instead of one after another
       const persisted = sorted.filter((entry) => !entry.live && persistence && typeof persistence.inspect === "function");
@@ -500,7 +499,6 @@ export function apply(ctx) {
           createdAt: entry.createdAt,
         });
       }
-      console.log(`[dsh-desktop-pet] listSessions => ${rows.length} top-level sessions`);
       return rows;
     } catch (err) {
       console.error("[dsh-desktop-pet] listSessions failed:", err?.message ?? err);
@@ -588,7 +586,6 @@ export function apply(ctx) {
    *  { skipped, shown } when rows were cut; failed = the persisted read
    *  threw, so the panel can offer a retry instead of an empty view. */
   const loadTranscript = async (sessionId) => {
-    const tLoad0 = Date.now();
     const agentsSvc = ctx.get("agents");
     const store = ctx.get("sessions");
     // the store FIRST — exactly the web's historySourceFor() ordering
@@ -596,7 +593,6 @@ export function apply(ctx) {
     const liveAgent = agentsSvc?.get?.(sessionId);
     const liveEvents = storeSession?.events ?? liveAgent?.session?.events;
     const hasLive = Array.isArray(liveEvents) && liveEvents.length > 0;
-    console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: storeSession=${!!storeSession} liveAgent=${!!liveAgent} liveEvents=${hasLive ? liveEvents.length : 0}`);
     let rows = null;
     let title;
     let usedEvents = null;
@@ -605,7 +601,6 @@ export function apply(ctx) {
       rows = transcriptOf(liveEvents);
       title = titleOf(liveEvents);
       usedEvents = liveEvents;
-      console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: LIVE path, ${rows.length} rows in ${Date.now() - tLoad0}ms`);
     } else {
       try {
         const persistence = ctx.get("sessionPersistence");
@@ -617,9 +612,7 @@ export function apply(ctx) {
           // AbortSignal parameter. inspectWithTimeout passes one, so the read
           // is genuinely cancelled (not just ignored), the handler reports
           // `failed`, and the pet offers a retry.
-          const tInsp = Date.now();
           const inspection = await inspectWithTimeout(persistence, sessionId);
-          console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: inspect returned ${inspection === undefined ? "undefined(aborted)" : (inspection?.events?.length ?? "?") + " events"} in ${Date.now() - tInsp}ms`);
           if (inspection === undefined) {
             // aborted (too slow) — distinct from a missing session
             failed = true;
@@ -640,7 +633,6 @@ export function apply(ctx) {
           id: msg?.id,
         })).filter((row) => row.text);
       }
-      console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: PERSISTENCE path done, ${rows?.length ?? 0} rows, failed=${failed}, in ${Date.now() - tLoad0}ms`);
     }
     if (!Array.isArray(rows)) rows = [];
     // age-aware cap: conversations idle for a long time show even less
@@ -715,9 +707,7 @@ export function apply(ctx) {
         });
       }
       chatFollowSessionId = cmd.sessionId; // panel shows exactly this session
-      const t0 = Date.now();
       const { rows: history, title, truncated, failed } = await loadTranscript(cmd.sessionId);
-      console.log(`[dsh-desktop-pet] select-session ${cmd.sessionId}: ${history.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}${truncated ? ` (truncated -${truncated.skipped})` : ""}`);
       sendSignal({ type: "chat", kind: "history", sessionId: cmd.sessionId, rows: history, title, truncated, failed });
     } else if (cmd.cmd === "current-session") {
       // The panel opened (or reopened): mirror whatever conversation is live —
@@ -737,9 +727,7 @@ export function apply(ctx) {
         sendSignal({ type: "chat", kind: "history", sessionId: null, rows: [] });
         return;
       }
-      const t0 = Date.now();
       const { rows: history, title, truncated, failed } = await loadTranscript(targetId);
-      console.log(`[dsh-desktop-pet] current-session ${targetId}: ${history.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}`);
       sendSignal({ type: "chat", kind: "history", sessionId: targetId, rows: history, title, follow, truncated, failed });
     } else if (cmd.cmd === "reset-chat-target") {
       // The panel closed: drop the pinned target so the next open follows the
@@ -842,7 +830,6 @@ export function apply(ctx) {
         const payload = await res.json().catch(() => ({}));
         if (payload && typeof payload === "object" && payload.cmd) {
           hadCommand = true;
-          console.log("[dsh-desktop-pet] chat command:", payload?.cmd, payload?.sessionId ?? "");
           // Do NOT await the handler here: some commands (select-session /
           // current-session) read the persisted session log, which can take
           // many seconds (or hang) on a large/corrupt transcript. Awaiting it
@@ -859,7 +846,9 @@ export function apply(ctx) {
       }
     } catch (err) {
       if (err?.name === "AbortError") {
-        console.error("[dsh-desktop-pet] poll round-trip aborted (pet unresponsive?) — re-polling");
+        // expected when the pet window is starting / offline: the round-trip
+        // hits its hard bound and we simply re-poll after backoff. Not an
+        // error worth printing on every cycle.
       }
       /* pet offline — retry after backoff */
     } finally {
