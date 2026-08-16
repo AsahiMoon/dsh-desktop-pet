@@ -82,12 +82,12 @@ function writeLog(level, message) {
 const STATE_FILE = () => path.join(app.getPath("userData"), "pet-state.json");
 const CONFIG_FILE = () => path.join(app.getPath("userData"), "config.json");
 
-// Local HTTP signal channel shared with the dsh-desktop-pet bundle Node half.
+// Local HTTP channel shared with the dsh-desktop-pet bundle Node half. ONE
+// port, owned by the pet window: the plugin POSTs state/chat signals to
+// /signal and long-polls /poll to collect user prompts. The plugin itself
+// never listens — no extra port, no inbound surface.
 const SIGNAL_PORT = 43991;
 const SIGNAL_HOST = "127.0.0.1";
-// Inbound chat-prompt listener (plugin Node half; see index.mjs CHAT_PORT).
-const CHAT_PORT = 43992;
-const CHAT_HOST = "127.0.0.1";
 
 // Default config — keep in sync with config.mjs DEFAULTS (the DSH settings
 // schema source of truth; this copy serves the standalone app).
@@ -531,12 +531,62 @@ function syncBuiltinCharacters() {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP signal listener (agent-state sync from the DSH bundle)
+// HTTP channel (agent-state sync from the DSH bundle, one port, pet-owned)
+//   POST /signal  — plugin pushes state/chat signals (existing behavior)
+//   POST /poll    — plugin long-polls for user prompts queued by the chat
+//                   window (drains one prompt per response; a pending poll
+//                   resolves immediately when a prompt arrives, or after
+//                   POLL_HOLD_MS with { empty: true } so the plugin can retry)
 // ---------------------------------------------------------------------------
+const POLL_HOLD_MS = 20_000; // longest the plugin waits before re-polling
+const chatPromptQueue = [];
+let pendingPoll = null; // { res } parked while the queue is empty
+
+/** Queue one user prompt for the plugin to collect via /poll. */
+function enqueueChatPrompt(text) {
+  chatPromptQueue.push(text);
+  if (pendingPoll) {
+    const { res } = pendingPoll;
+    pendingPoll = null;
+    deliverPoll(res);
+  }
+}
+
+/** Answer one /poll request with the next queued prompt (or park it). */
+function deliverPoll(res) {
+  const text = chatPromptQueue.shift();
+  if (text !== undefined) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ text }));
+    return;
+  }
+  pendingPoll = { res };
+  const timer = setTimeout(() => {
+    if (pendingPoll?.res === res) {
+      pendingPoll = null;
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ empty: true }));
+    }
+  }, POLL_HOLD_MS);
+  res.on("close", () => {
+    clearTimeout(timer);
+    if (pendingPoll?.res === res) pendingPoll = null;
+  });
+}
+
 function startSignalServer() {
   const server = http.createServer((req, res) => {
-    if (req.method !== "POST" || req.url !== "/signal") {
+    if (req.method !== "POST") {
       res.writeHead(405);
+      res.end();
+      return;
+    }
+    if (req.url === "/poll") {
+      deliverPoll(res);
+      return;
+    }
+    if (req.url !== "/signal") {
+      res.writeHead(404);
       res.end();
       return;
     }
@@ -880,19 +930,10 @@ function openChatWindow() {
 function closeChatWindow() {
   if (chatWin && !chatWin.isDestroyed()) chatWin.close();
 }
-/** Submit one user prompt to the plugin chat bridge (best-effort). */
-async function sendChatPrompt(text) {
-  try {
-    const res = await fetch(`http://${CHAT_HOST}:${CHAT_PORT}/prompt`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text }),
-    });
-    const payload = await res.json().catch(() => ({}));
-    return { ok: res.ok, error: payload.error ?? null };
-  } catch (err) {
-    return { ok: false, error: err?.message ?? String(err) };
-  }
+/** Queue one user prompt for the plugin's /poll long-poll (best-effort). */
+function sendChatPrompt(text) {
+  enqueueChatPrompt(text);
+  return { ok: true, error: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -1165,7 +1206,7 @@ function setupIpc() {
   // chat: a separate window to talk to the DSH agent
   ipcMain.on("pet:chat-open", () => openChatWindow());
   ipcMain.on("pet:chat-close", () => closeChatWindow());
-  ipcMain.handle("pet:chat-send", async (_e, text) => {
+  ipcMain.handle("pet:chat-send", (_e, text) => {
     if (typeof text !== "string" || !text.trim()) return { ok: false, error: "empty" };
     return sendChatPrompt(text.trim());
   });

@@ -13,17 +13,17 @@
  *    behavior without a restart.
  * 3. Spawn the Electron pet window on boot (the pet's own single-instance
  *    lock keeps a manually started window from being duplicated).
- * 4. Serve a local chat bridge: the pet window POSTs user prompts to
- *    http://127.0.0.1:43992/prompt; this half submits them to the active
- *    agent via agent.followup() and forwards the agent's streamed reply back
- *    over the 43991 signal channel as chat signals.
+ * 4. Chat bridge over the pet's single 43991 port: this half long-polls
+ *    /poll for user prompts (the pet window never exposes a port), submits
+ *    them to the active agent via agent.followup() and forwards the agent's
+ *    streamed reply back over /signal as chat signals. One port total — the
+ *    pet's — so the plugin opens no listener of its own.
  *
  * The pet window also works standalone without this plugin (local autonomous
  * behavior, config from its own config.json); the plugin adds the agent-state
  * sync channel and the settings-backed hot config.
  */
 import { spawn } from "node:child_process";
-import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
@@ -35,11 +35,10 @@ export const name = "dsh-desktop-pet";
 export const inject = ["jobs", "sessions", "agents", "settings"];
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
+// The single local channel port, owned by the pet window: /signal pushes
+// state to the pet, /poll drains queued user prompts (long-polled here).
 const PORT = 43991;
 const HOST = "127.0.0.1";
-/** Inbound chat-prompt listener (the pet window POSTs user input here). */
-const CHAT_PORT = 43992;
-const CHAT_HOST = "127.0.0.1";
 
 /** Resolve an executable that can run main.js: the electron package when it is
  *  installed anywhere up the node_modules tree (dev setups, local installs),
@@ -178,12 +177,14 @@ function ensurePet() {
 export function apply(ctx) {
   ensurePet();
 
-  // ---- chat bridge: receive prompts from the pet window, forward replies ----
-  // The pet window POSTs { text } to http://127.0.0.1:43992/prompt. We route
-  // it to the most recently active agent (or resume the most recent persisted
-  // session when no agent is live yet) via agent.followup(); the agent's
-  // streamed reply comes back through session/event and is pushed over the
-  // existing 43991 signal channel as chat signals ({ type: 'chat', ... }).
+  // ---- chat bridge: collect prompts from the pet window, forward replies ----
+  // The pet window never exposes a port: this half LONG-POLLS the pet's own
+  // 43991 /poll endpoint for queued user prompts, routes each to the most
+  // recently active agent (or resumes the latest persisted session when no
+  // agent is live yet) via agent.followup(); the agent's streamed reply comes
+  // back through session/event and is pushed over the same 43991 /signal
+  // channel as chat signals ({ type: 'chat', ... }). One port total — the
+  // pet's — and this half opens no listener of its own.
   let chatTargetAgent = null;
   let chatStreaming = false;
   let chatStreamText = "";
@@ -266,43 +267,30 @@ export function apply(ctx) {
     chatStreamText = "";
   };
 
-  const chatServer = http.createServer((req, res) => {
-    if (req.method !== "POST" || req.url !== "/prompt") {
-      res.writeHead(404, { "content-type": "application/json" });
-      res.end(JSON.stringify({ error: "not found" }));
-      return;
-    }
-    let body = "";
-    req.on("data", (chunk) => {
-      body += chunk;
-      if (body.length > 64 * 1024) req.destroy();
-    });
-    req.on("end", () => {
-      try {
-        const payload = JSON.parse(body);
+  // Long-poll loop: one in-flight /poll at a time, backoff on failure so a
+  // pet that is starting (or offline) does not spin. The pet answers with
+  // { text } (drain one prompt) or { empty: true } after its hold window.
+  let pollTimer = null;
+  let polling = false;
+  const pollDelay = (attempt) => Math.min(10_000, 200 * attempt);
+  const pollOnce = async (attempt) => {
+    if (polling) return;
+    polling = true;
+    try {
+      const res = await fetch(`http://${HOST}:${PORT}/poll`, { method: "POST" });
+      if (res.ok) {
+        const payload = await res.json().catch(() => ({}));
         const text = typeof payload?.text === "string" ? payload.text.trim() : "";
-        if (!text) {
-          res.writeHead(400, { "content-type": "application/json" });
-          res.end(JSON.stringify({ error: "empty prompt" }));
-          return;
-        }
-        // submitChatPrompt is now async (may resume a persisted session).
-        void submitChatPrompt(text).then((ok) => {
-          res.writeHead(ok ? 200 : 409, { "content-type": "application/json" });
-          res.end(JSON.stringify({ ok }));
-        });
-      } catch (e) {
-        res.writeHead(400, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: e.message }));
+        if (text) await submitChatPrompt(text);
       }
-    });
-  });
-  chatServer.on("error", (err) => {
-    console.error("[dsh-desktop-pet] chat server error:", err?.message ?? err);
-  });
-  chatServer.listen(CHAT_PORT, CHAT_HOST, () => {
-    console.log(`[dsh-desktop-pet] chat bridge listening on ${CHAT_HOST}:${CHAT_PORT}`);
-  });
+    } catch {
+      /* pet offline — retry after backoff */
+    } finally {
+      polling = false;
+    }
+    pollTimer = setTimeout(() => pollOnce(attempt + 1), pollDelay(attempt));
+  };
+  pollOnce(1);
 
   // ---- config: register with DSH settings, hot-push on change ----
   const settings = typeof ctx.get === "function" ? ctx.get("settings") : undefined;
@@ -525,7 +513,7 @@ export function apply(ctx) {
     clearInterval(heartbeat);
     clearTimeout(petRespawnTimer);
     clearTimeout(petRespawnResetTimer);
-    chatServer.close();
+    clearTimeout(pollTimer);
     // note: the spawned pet is NOT killed here — the user may want it to keep
     // running when the plugin unloads (e.g. dsh web restarts)
     for (const dispose of disposers) {
