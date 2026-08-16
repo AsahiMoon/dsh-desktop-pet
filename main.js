@@ -646,6 +646,9 @@ function startSignalServer() {
           if (signal.type === "chat") {
             const s = signal;
             console.log(`[pet] signal chat kind=${s?.kind} session=${s?.sessionId ?? ""} rows=${Array.isArray(s?.rows) ? s.rows.length : ""}${s?.failed ? " FAILED" : ""}${s?.follow ? " follow" : ""}`);
+            if (s?.kind === "sessions" && Array.isArray(s?.list)) {
+              console.log(`[pet] sessions list (${s.list.length}): ${s.list.map((x) => `${x.title ?? x.id}${x.preview ? " | " + x.preview : ""}`).join(" ;; ")}`);
+            }
           }
           broadcast(signal);
           if (win && !win.isDestroyed()) win.setTitle(`dsh-desktop-pet · ${signal.type}`);

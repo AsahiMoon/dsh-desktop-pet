@@ -212,6 +212,13 @@ export function apply(ctx) {
   };
   /** Text of one message's content blocks (text blocks only). */
   const messageText = (content) => textOfBlocks(content);
+  /** A lone period / whitespace is not a real title or message — filter it so
+   *  empty streams never surface as a "." conversation or bubble. */
+  const isTrivialText = (s) => {
+    if (typeof s !== "string") return true;
+    const t = s.trim();
+    return t.length === 0 || /^[.。…·•*\-—_~ ]+$/.test(t);
+  };
   /** Extract user/assistant transcript rows from a session's events.
    *  Rows carry the message id so callers can tell them apart (e.g. drop the
    *  triggering message from a follow-switch history instead of showing it
@@ -229,10 +236,10 @@ export function apply(ctx) {
       const data = event.data;
       if (event.type === "user/message" && data?.content) {
         const text = messageText(data.content);
-        if (text) rows.push({ role: "user", text, ts: event.time, id: data?.id });
+        if (!isTrivialText(text)) rows.push({ role: "user", text, ts: event.time, id: data?.id });
       } else if (event.type === "assistant/message" && data?.message?.content) {
         const text = messageText(data.message.content);
-        if (text) rows.push({ role: "assistant", text, ts: event.time, id: data?.message?.id });
+        if (!isTrivialText(text)) rows.push({ role: "assistant", text, ts: event.time, id: data?.message?.id });
       } else if (event.type === "tool/call") {
         // a tool call row — the renderer draws it as a frosted tool card;
         // the matching tool/result below marks it done and adds the output
@@ -322,7 +329,7 @@ export function apply(ctx) {
       let text = null;
       if (ev?.type === "user/message" && data?.content) text = messageText(data.content);
       else if (ev?.type === "assistant/message" && data?.message?.content) text = messageText(data.message.content);
-      if (text) return text.slice(0, 80);
+      if (!isTrivialText(text)) return text.slice(0, 80);
     }
     return "";
   };
@@ -421,12 +428,17 @@ export function apply(ctx) {
             preview = m?.preview ?? "";
           }
         } catch { /* keep header-only row */ }
+        // the web hides blank sessions (no title, no message) — a stray "."
+        // from a degenerate auto-title, or an empty pet-created session, is
+        // clutter, not a conversation. Skip it.
+        if (isTrivialText(title) && isTrivialText(preview)) continue;
         rows.push({
           id: entry.id,
           // no "会话" prefix — the date lives in the row's meta already, and
-          // this fallback also shows in the chat title bar
-          title: title ?? "未命名",
-          preview,
+          // this fallback also shows in the chat title bar; a lone "." from a
+          // degenerate auto-title is never a real title
+          title: isTrivialText(title) ? "未命名" : title,
+          preview: isTrivialText(preview) ? "" : preview,
           createdAt: entry.createdAt,
         });
       }
@@ -566,6 +578,8 @@ export function apply(ctx) {
       rows = rows.slice(rows.length - cap);
       truncated = { skipped, shown: rows.length };
     }
+    // a degenerate auto-title (".") should read as "untitled", not a lone dot
+    if (isTrivialText(title)) title = undefined;
     return { rows, title, truncated, failed };
   };
   /** Submit one prompt from the pet window to the chosen agent. */
@@ -715,7 +729,9 @@ export function apply(ctx) {
   const chatStreamEnd = (sid) => {
     if (!chatStreaming) return;
     chatStreaming = false;
-    sendSignal({ type: "chat", kind: "assistant", text: chatStreamText, sessionId: sid });
+    if (!isTrivialText(chatStreamText)) {
+      sendSignal({ type: "chat", kind: "assistant", text: chatStreamText, sessionId: sid });
+    }
     chatStreamText = "";
   };
 
@@ -914,7 +930,7 @@ export function apply(ctx) {
         const sid = session?.id;
         if (type === "user/message") {
           const text = textOfBlocks(event?.data?.content);
-          if (text) {
+          if (!isTrivialText(text)) {
             if (chatFollowSessionId !== sid) {
               // a different conversation became active (e.g. the user typed in
               // another web session): load its transcript FIRST (awaited so it
@@ -948,7 +964,7 @@ export function apply(ctx) {
           chatStreaming = false;
           chatStreamText = "";
           const text = textOfBlocks(event?.data?.message?.content);
-          if (text) sendSignal({ type: "chat", kind: "assistant", text, sessionId: sid });
+          if (!isTrivialText(text)) sendSignal({ type: "chat", kind: "assistant", text, sessionId: sid });
           // accumulate this step's usage into the turn stats readout
           const usage = event?.data?.usage;
           if (usage) {
