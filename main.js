@@ -616,7 +616,12 @@ function startSignalServer() {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
-      if (body.length > 64 * 1024) req.destroy();
+      // History transcripts legitimately run to a few hundred KB (a truncated
+      // 250-row tail with tool outputs); 64KB silently DROPPED them — the
+      // plugin's history signal never arrived and the panel "timed out". Allow
+      // a generous bounded body so transcripts always land, still capped to
+      // stop a runaway/abusive POST from exhausting memory.
+      if (body.length > 8 * 1024 * 1024) req.destroy();
     });
     req.on("end", () => {
       try {

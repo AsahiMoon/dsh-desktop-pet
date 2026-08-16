@@ -243,7 +243,7 @@ export function apply(ctx) {
           const args = JSON.parse(data?.arguments ?? "{}");
           summary = toolDetailOf(data?.name, args);
           const json = JSON.stringify(args);
-          if (json && json !== "{}") argsText = json.length > 4000 ? `${json.slice(0, 4000)}…` : json;
+          if (json && json !== "{}") argsText = json.length > 1500 ? `${json.slice(0, 1500)}…` : json;
         } catch {
           /* arguments not parseable — keep header-only card */
         }
@@ -271,7 +271,7 @@ export function apply(ctx) {
         };
         collect(data?.message?.content);
         const joined = strings.join("\n").trim();
-        if (joined) output = joined.length > 4000 ? `${joined.slice(0, 4000)}…` : joined;
+        if (joined) output = joined.length > 1500 ? `${joined.slice(0, 1500)}…` : joined;
         const row = callId ? toolByCall.get(callId) : null;
         if (row) {
           row.done = true;
@@ -974,7 +974,7 @@ export function apply(ctx) {
             const args = JSON.parse(event?.data?.arguments ?? "{}");
             summary = toolDetailOf(name, args);
             const json = JSON.stringify(args);
-            if (json && json !== "{}") argsText = json.length > 4000 ? `${json.slice(0, 4000)}…` : json;
+            if (json && json !== "{}") argsText = json.length > 1500 ? `${json.slice(0, 1500)}…` : json;
           } catch {
             /* arguments not (yet) parseable — keep header-only card */
           }
@@ -994,7 +994,7 @@ export function apply(ctx) {
           };
           collect(event?.data?.message?.content);
           const joined = strings.join("\n").trim();
-          if (joined) output = joined.length > 4000 ? `${joined.slice(0, 4000)}…` : joined;
+          if (joined) output = joined.length > 1500 ? `${joined.slice(0, 1500)}…` : joined;
           sendSignal({ type: "chat", kind: "tool-done", callId, output, isError, sessionId: sid });
         } else if (type === "turn/end") {
           chatStreamEnd(sid); // sends a partial reply only if the stream is open
