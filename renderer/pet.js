@@ -1103,7 +1103,8 @@ async function boot() {
   }
 
   if (CHAT_MODE) {
-    // separate chat window: message list + input box, no pet sprite.
+    // legacy ?chat=1 mode — kept for safety but no longer used by the app;
+    // the chat panel now lives inside the pet window itself.
     document.body.dataset.chat = "";
     document.getElementById("chat").classList.remove("hidden");
     bootChat();
@@ -1142,23 +1143,37 @@ async function boot() {
   setInterval(tickIdle, 5000);
   setInterval(maybeWalk, 5000);
   setInterval(() => saveLedgerSoon(), 30000);
+
+  // The in-pet-window chat panel initializes with the pet window; it stays
+  // hidden until the user opens it (tray / right-click「💬 对话」).
+  bootChat();
 }
 
 // ---------------------------------------------------------------------------
-// chat window mode (?chat=1) — talk to the DSH agent without the web UI.
-// Messages echo locally on send; the plugin streams assistant text back as
-// chat signals (kind: user / delta / assistant / done / error).
+// chat panel — lives INSIDE the pet window, beside the model. Opening the
+// panel (tray/right-click「💬 对话」) enlarges the window via pet:chat-panel;
+// the renderer lays the panel out in the grown area. It shows a session
+// picker (history), the transcript of the chosen session, an input box, and
+// streams assistant replies as chat signals (kind: user / delta / assistant /
+// done / error / sessions / history).
 // ---------------------------------------------------------------------------
 function bootChat() {
+  const chatEl = document.getElementById("chat");
   const messagesEl = document.getElementById("chat-messages");
   const inputEl = document.getElementById("chat-input");
   const sendBtn = document.getElementById("chat-send");
   const hintEl = document.getElementById("chat-hint");
   const closeBtn = document.getElementById("chat-close");
+  const sessionsEl = document.getElementById("chat-sessions");
+  const pickerBtn = document.getElementById("chat-session-picker");
+  const titleLabel = document.getElementById("chat-title-label");
 
   let busy = false;
   let assistantBubble = null; // the in-progress assistant bubble being streamed
   let history = []; // [{ role: 'user' | 'assistant', text }]
+  let sessions = []; // [{ id, title, preview, createdAt }]
+  let currentSessionId = null;
+  let chatInitialized = false;
 
   /** Append one message row; returns the row element (for streaming). */
   const appendRow = (role, text) => {
@@ -1173,10 +1188,53 @@ function bootChat() {
     return { row, bubbleEl };
   };
 
-  /** Render all buffered history (used on boot for a fresh window). */
+  /** Render all buffered history. */
   const renderHistory = () => {
     messagesEl.innerHTML = "";
     for (const item of history) appendRow(item.role, item.text);
+  };
+
+  /** Replace history with one session's transcript rows. */
+  const showHistory = (rows) => {
+    history = Array.isArray(rows) ? rows.map((r) => ({ role: r.role === "user" ? "user" : "assistant", text: r.text ?? "" })) : [];
+    renderHistory();
+  };
+
+  /** Render the session picker list. */
+  const renderSessions = () => {
+    sessionsEl.innerHTML = "";
+    if (!sessions.length) {
+      const empty = document.createElement("div");
+      empty.className = "chat-session-empty";
+      empty.textContent = "暂无历史会话";
+      sessionsEl.append(empty);
+      return;
+    }
+    for (const s of sessions) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "chat-session-row" + (s.id === currentSessionId ? " active" : "");
+      const title = document.createElement("div");
+      title.className = "chat-session-title";
+      title.textContent = s.title ?? s.id;
+      if (s.preview) {
+        const preview = document.createElement("div");
+        preview.className = "chat-session-preview";
+        preview.textContent = s.preview;
+        row.append(title, preview);
+      } else {
+        row.append(title);
+      }
+      row.addEventListener("click", () => {
+        currentSessionId = s.id;
+        titleLabel.textContent = `会话 · ${s.title ?? ""}`;
+        sessionsEl.classList.add("hidden");
+        renderSessions();
+        setHint("⏳ 加载历史…");
+        window.petAPI.selectSession(s.id);
+      });
+      sessionsEl.append(row);
+    }
   };
 
   /** Handle one chat signal from the plugin. */
@@ -1217,6 +1275,14 @@ function bootChat() {
       setHint("");
       if (inputEl) inputEl.disabled = false;
       if (sendBtn) sendBtn.disabled = false;
+    } else if (kind === "sessions") {
+      sessions = Array.isArray(signal.list) ? signal.list : [];
+      renderSessions();
+    } else if (kind === "history") {
+      showHistory(signal.rows);
+      currentSessionId = signal.sessionId ?? null;
+      setHint("💬 在下方输入消息继续这个对话");
+      if (inputEl) inputEl.focus();
     }
   };
 
@@ -1249,8 +1315,23 @@ function bootChat() {
     }
   };
 
-  if (window.petAPI && typeof window.petAPI.onSignal === "function") {
-    window.petAPI.onSignal(onChatSignal);
+  const onChatPanel = (payload) => {
+    const open = !!payload?.open;
+    chatEl.classList.toggle("hidden", !open);
+    if (open) {
+      if (!chatInitialized) {
+        chatInitialized = true;
+        if (window.petAPI && typeof window.petAPI.onSignal === "function") {
+          window.petAPI.onSignal(onChatSignal);
+        }
+      }
+      setHint("💬 点击 🗂️ 选择历史会话，或直接输入消息");
+      if (inputEl) inputEl.focus();
+    }
+  };
+
+  if (window.petAPI && typeof window.petAPI.onChatPanel === "function") {
+    window.petAPI.onChatPanel(onChatPanel);
   }
   sendBtn.addEventListener("click", send);
   inputEl.addEventListener("keydown", (e) => {
@@ -1260,8 +1341,12 @@ function bootChat() {
     }
   });
   closeBtn.addEventListener("click", () => window.petAPI.closeChat());
-  setHint("💬 在下方输入消息，和 Agent 对话（无需打开网页）");
-  inputEl.focus();
+  pickerBtn.addEventListener("click", () => {
+    sessionsEl.classList.toggle("hidden");
+    if (!sessionsEl.classList.contains("hidden") && window.petAPI) {
+      window.petAPI.listSessions();
+    }
+  });
 }
 
 boot();

@@ -51,6 +51,14 @@ contextBridge.exposeInMainWorld("petAPI", {
   closeChat: () => ipcRenderer.send("pet:chat-close"),
   /** Submit one prompt to the DSH agent through the plugin chat bridge. */
   sendChat: (text) => ipcRenderer.invoke("pet:chat-send", text),
+  /** Ask the plugin to list persisted sessions (chat panel picker). */
+  listSessions: () => ipcRenderer.send("pet:chat-list-sessions"),
+  /** Switch the chat to one historical session (loads its transcript). */
+  selectSession: (sessionId) => ipcRenderer.send("pet:chat-select-session", sessionId),
+  /** Subscribe to chat-panel open/close events (in-pet-window panel). */
+  onChatPanel: (cb) => {
+    ipcRenderer.on("pet:chat-panel", (_event, payload) => cb(payload));
+  },
   /** Quit the app. */
   quit: () => ipcRenderer.send("pet:quit"),
 });

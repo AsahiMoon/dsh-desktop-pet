@@ -177,17 +177,80 @@ function ensurePet() {
 export function apply(ctx) {
   ensurePet();
 
-  // ---- chat bridge: collect prompts from the pet window, forward replies ----
+  // ---- chat bridge: collect commands from the pet window, forward replies ----
   // The pet window never exposes a port: this half LONG-POLLS the pet's own
-  // 43991 /poll endpoint for queued user prompts, routes each to the most
-  // recently active agent (or resumes the latest persisted session when no
-  // agent is live yet) via agent.followup(); the agent's streamed reply comes
-  // back through session/event and is pushed over the same 43991 /signal
-  // channel as chat signals ({ type: 'chat', ... }). One port total — the
+  // 43991 /poll endpoint for queued commands ({ cmd: 'prompt'|'list-sessions'
+  // |'select-session' }), routes prompts to the chosen agent (or resumes the
+  // latest persisted session when none is live yet) via agent.followup();
+  // the agent's streamed reply comes back through session/event and is pushed
+  // over the same 43991 /signal channel as chat signals. One port total — the
   // pet's — and this half opens no listener of its own.
   let chatTargetAgent = null;
   let chatStreaming = false;
   let chatStreamText = "";
+  /** Text of one message's content blocks (text blocks only). */
+  const messageText = (content) => textOfBlocks(content);
+  /** Extract user/assistant transcript rows from a session's events.
+   *  @returns [{ role: 'user'|'assistant', text, ts }] in log order. */
+  const transcriptOf = (events) => {
+    if (!Array.isArray(events)) return [];
+    const rows = [];
+    for (const event of events) {
+      if (!event || typeof event !== "object") continue;
+      const data = event.data;
+      if (event.type === "user/message" && data?.content) {
+        const text = messageText(data.content);
+        if (text) rows.push({ role: "user", text, ts: event.time });
+      } else if (event.type === "assistant/message" && data?.message?.content) {
+        const text = messageText(data.message.content);
+        if (text) rows.push({ role: "assistant", text, ts: event.time });
+      }
+    }
+    return rows;
+  };
+  /** Latest session/title event text, or undefined. */
+  const titleOf = (events) => {
+    if (!Array.isArray(events)) return undefined;
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i];
+      if (event?.type === "session/title" && typeof event?.data?.title === "string"
+        && event.data.title.trim()) return event.data.title.trim();
+    }
+    return undefined;
+  };
+  /** List persisted sessions with their titles and a message preview. */
+  const listSessions = async () => {
+    try {
+      const persistence = ctx.get("sessionPersistence");
+      if (!persistence || typeof persistence.list !== "function") return [];
+      const headers = await persistence.list();
+      if (!Array.isArray(headers)) return [];
+      const rows = [];
+      for (const header of [...headers].sort((a, b) => b.createdAt - a.createdAt).slice(0, 20)) {
+        let title;
+        let preview = "";
+        try {
+          if (typeof persistence.inspect === "function") {
+            const inspection = await persistence.inspect(header.id);
+            title = titleOf(inspection?.events);
+            const transcript = transcriptOf(inspection?.events);
+            const last = transcript.at(-1);
+            preview = last ? last.text.slice(0, 80) : "";
+          }
+        } catch { /* keep header-only row */ }
+        rows.push({
+          id: header.id,
+          title: title ?? `会话 ${header.createdAt ? new Date(header.createdAt).toLocaleString("zh-CN") : ""}`,
+          preview,
+          createdAt: header.createdAt,
+        });
+      }
+      return rows;
+    } catch (err) {
+      console.error("[dsh-desktop-pet] listSessions failed:", err?.message ?? err);
+      return [];
+    }
+  };
   /** Pick the agent the pet chat should talk to (live agents only). */
   const pickLiveChatAgent = () => {
     const agentsSvc = ctx.get("agents");
@@ -223,11 +286,46 @@ export function apply(ctx) {
       return undefined;
     }
   };
+  /** Resume one EXACT persisted session id as a live agent (best-effort). */
+  const resumeSessionAgent = async (sessionId) => {
+    try {
+      const agentsSvc = ctx.get("agents");
+      if (!agentsSvc || typeof agentsSvc.resume !== "function") return undefined;
+      if (typeof sessionId !== "string" || !sessionId) return undefined;
+      const handle = await agentsSvc.resume({ resumeSessionId: sessionId });
+      if (!handle?.agent) return undefined;
+      return handle.agent;
+    } catch (err) {
+      console.error("[dsh-desktop-pet] resume failed:", err?.message ?? err);
+      return undefined;
+    }
+  };
   /** Resolve the chat target: live agent first, else resume the latest session. */
   const resolveChatAgent = async () => {
     const live = pickLiveChatAgent();
     if (live) return live;
     return resumeRecentAgent();
+  };
+  /** Load the transcript of one session (live agent's session or persisted). */
+  const loadHistory = async (sessionId) => {
+    // Live agent first (its session has deriveMessages).
+    const agentsSvc = ctx.get("agents");
+    const liveAgent = agentsSvc?.get?.(sessionId);
+    if (liveAgent?.session && typeof liveAgent.session.deriveMessages === "function") {
+      return liveAgent.session.deriveMessages().map((msg) => ({
+        role: msg?.role === "user" ? "user" : "assistant",
+        text: messageText(msg?.content),
+      })).filter((row) => row.text);
+    }
+    try {
+      const persistence = ctx.get("sessionPersistence");
+      if (!persistence || typeof persistence.inspect !== "function") return [];
+      const inspection = await persistence.inspect(sessionId);
+      return transcriptOf(inspection?.events);
+    } catch (err) {
+      console.error("[dsh-desktop-pet] loadHistory failed:", err?.message ?? err);
+      return [];
+    }
   };
   /** Submit one prompt from the pet window to the chosen agent. */
   const submitChatPrompt = async (text) => {
@@ -246,6 +344,27 @@ export function apply(ctx) {
       console.error("[dsh-desktop-pet] followup failed:", err?.message ?? err);
       sendSignal({ type: "chat", kind: "error", text: `提交失败：${err?.message ?? err}` });
       return false;
+    }
+  };
+  /** Handle one command drained from the pet window's /poll queue. */
+  const handleChatCommand = async (cmd) => {
+    if (!cmd || typeof cmd !== "object") return;
+    if (cmd.cmd === "prompt" && typeof cmd.text === "string" && cmd.text.trim()) {
+      await submitChatPrompt(cmd.text.trim());
+    } else if (cmd.cmd === "list-sessions") {
+      const rows = await listSessions();
+      sendSignal({ type: "chat", kind: "sessions", list: rows });
+    } else if (cmd.cmd === "select-session" && typeof cmd.sessionId === "string") {
+      // Resume the exact session (if not live) and make it the chat target.
+      const live = ctx.get("agents")?.get?.(cmd.sessionId);
+      const agent = live ?? await resumeSessionAgent(cmd.sessionId);
+      if (agent && typeof agent.followup === "function") {
+        chatTargetAgent = agent;
+        chatStreaming = false;
+        chatStreamText = "";
+      }
+      const history = await loadHistory(cmd.sessionId);
+      sendSignal({ type: "chat", kind: "history", sessionId: cmd.sessionId, rows: history });
     }
   };
   /** Is this event from the agent the pet chat is talking to? */
@@ -268,8 +387,9 @@ export function apply(ctx) {
   };
 
   // Long-poll loop: one in-flight /poll at a time, backoff on failure so a
-  // pet that is starting (or offline) does not spin. The pet answers with
-  // { text } (drain one prompt) or { empty: true } after its hold window.
+  // pet that is starting (or offline) does not spin. The pet answers with a
+  // command ({ cmd: 'prompt'|'list-sessions'|'select-session', ... }) or
+  // { empty: true } after its hold window.
   let pollTimer = null;
   let polling = false;
   const pollDelay = (attempt) => Math.min(10_000, 200 * attempt);
@@ -280,8 +400,9 @@ export function apply(ctx) {
       const res = await fetch(`http://${HOST}:${PORT}/poll`, { method: "POST" });
       if (res.ok) {
         const payload = await res.json().catch(() => ({}));
-        const text = typeof payload?.text === "string" ? payload.text.trim() : "";
-        if (text) await submitChatPrompt(text);
+        if (payload && typeof payload === "object" && payload.cmd) {
+          await handleChatCommand(payload);
+        }
       }
     } catch {
       /* pet offline — retry after backoff */

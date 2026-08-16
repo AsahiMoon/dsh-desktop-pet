@@ -539,12 +539,12 @@ function syncBuiltinCharacters() {
 //                   POLL_HOLD_MS with { empty: true } so the plugin can retry)
 // ---------------------------------------------------------------------------
 const POLL_HOLD_MS = 20_000; // longest the plugin waits before re-polling
-const chatPromptQueue = [];
+const chatCommandQueue = [];
 let pendingPoll = null; // { res } parked while the queue is empty
 
-/** Queue one user prompt for the plugin to collect via /poll. */
-function enqueueChatPrompt(text) {
-  chatPromptQueue.push(text);
+/** Queue one chat command for the plugin to collect via /poll. */
+function enqueueChatCommand(cmd) {
+  chatCommandQueue.push(cmd);
   if (pendingPoll) {
     const { res } = pendingPoll;
     pendingPoll = null;
@@ -552,12 +552,12 @@ function enqueueChatPrompt(text) {
   }
 }
 
-/** Answer one /poll request with the next queued prompt (or park it). */
+/** Answer one /poll request with the next queued command (or park it). */
 function deliverPoll(res) {
-  const text = chatPromptQueue.shift();
-  if (text !== undefined) {
+  const cmd = chatCommandQueue.shift();
+  if (cmd !== undefined) {
     res.writeHead(200, { "content-type": "application/json" });
-    res.end(JSON.stringify({ text }));
+    res.end(JSON.stringify(cmd));
     return;
   }
   pendingPoll = { res };
@@ -847,7 +847,7 @@ function refreshTrayMenu() {
   if (!tray) return;
   const menu = Menu.buildFromTemplate([
     { label: "显示 / 隐藏", click: () => toggleWindow() },
-    { label: "💬 对话", click: () => openChatWindow() },
+    { label: "💬 对话", click: () => openChatPanel() },
     { label: "回到右下角", click: () => {
       if (!win) return;
       const pos = defaultPosition();
@@ -884,55 +884,35 @@ function toggleWindow() {
 }
 
 // ---------------------------------------------------------------------------
-// chat window: a SEPARATE window for talking to the DSH agent. The pet window
-// itself never grows; the chat panel lives in its own BrowserWindow (the
-// same renderer in ?chat=1 mode). Prompts are POSTed to the plugin Node
-// half's local bridge; replies stream back as chat signals over broadcast().
+// chat panel: IN the pet window, beside the model. Opening chat enlarges the
+// pet window to CHAT_W x CHAT_H (the sprite stays at its top-left corner; the
+// renderer lays the chat panel out in the grown area). Closing restores the
+// pet's normal size at its current position. Prompts/replies flow over the
+// single 43991 channel (/poll commands + /signal chat signals).
 // ---------------------------------------------------------------------------
-let chatWin = null;
-function openChatWindow() {
-  if (chatWin && !chatWin.isDestroyed()) {
-    chatWin.show();
-    chatWin.focus();
-    return;
-  }
-  chatWin = new BrowserWindow({
-    width: 460,
-    height: 620,
-    minWidth: 340,
-    minHeight: 420,
-    title: "DSH Desktop Pet 对话",
-    resizable: true,
-    minimizable: true,
-    maximizable: true,
-    fullscreenable: false,
-    alwaysOnTop: false,
-    skipTaskbar: false,
-    icon: WINDOW_ICON(),
-    backgroundColor: "#0f1630",
-    webPreferences: {
-      preload: path.join(ROOT, "preload.js"),
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: false,
-      backgroundThrottling: false,
-    },
-  });
-  chatWin.setMenuBarVisibility(false);
-  chatWin.on("closed", () => {
-    chatWin = null;
-  });
-  chatWin.loadFile(path.join(ROOT, "renderer", "index.html"), { query: { chat: "1" } });
-  chatWin.webContents.on("console-message", (_e, level, message, line, sourceId) => {
-    console.log(`[chat:${level}] ${message} (${sourceId}:${line})`);
-  });
+const CHAT_W = 420;
+const CHAT_H = 560;
+let chatPanelOpen = false;
+function openChatPanel() {
+  if (!win || win.isDestroyed()) return;
+  if (chatPanelOpen) return;
+  chatPanelOpen = true;
+  const [x, y] = win.getPosition();
+  win.setBounds({ x, y, width: CHAT_W, height: CHAT_H });
+  win.webContents.send("pet:chat-panel", { open: true });
 }
-function closeChatWindow() {
-  if (chatWin && !chatWin.isDestroyed()) chatWin.close();
+function closeChatPanel() {
+  if (!win || win.isDestroyed()) return;
+  if (!chatPanelOpen) return;
+  chatPanelOpen = false;
+  const size = Math.max(64, Math.min(256, Math.round(config.size ?? DEFAULT_CONFIG.size)));
+  const [x, y] = win.getPosition();
+  win.setBounds({ x, y, width: size + WINDOW_EXTRA, height: size + WINDOW_STRIP });
+  win.webContents.send("pet:chat-panel", { open: false });
 }
 /** Queue one user prompt for the plugin's /poll long-poll (best-effort). */
 function sendChatPrompt(text) {
-  enqueueChatPrompt(text);
+  enqueueChatCommand({ cmd: "prompt", text });
   return { ok: true, error: null };
 }
 
@@ -992,7 +972,7 @@ function closeSettingsWindow() {
 
 /** Deliver a signal to every window (pet + settings + chat). */
 function broadcast(signal) {
-  for (const w of [win, settingsWin, chatWin]) {
+  for (const w of [win, settingsWin]) {
     if (w && !w.isDestroyed()) {
       try {
         w.webContents.send("pet:signal", signal);
@@ -1203,12 +1183,22 @@ function setupIpc() {
   ipcMain.on("pet:panel-open", () => openSettingsWindow());
   ipcMain.on("pet:panel-close", () => closeSettingsWindow());
 
-  // chat: a separate window to talk to the DSH agent
-  ipcMain.on("pet:chat-open", () => openChatWindow());
-  ipcMain.on("pet:chat-close", () => closeChatWindow());
+  // chat: an in-pet-window panel to talk to the DSH agent
+  ipcMain.on("pet:chat-open", () => openChatPanel());
+  ipcMain.on("pet:chat-close", () => closeChatPanel());
   ipcMain.handle("pet:chat-send", (_e, text) => {
     if (typeof text !== "string" || !text.trim()) return { ok: false, error: "empty" };
     return sendChatPrompt(text.trim());
+  });
+  // Ask the plugin for the persisted session list (shown in the chat panel).
+  ipcMain.on("pet:chat-list-sessions", () => {
+    enqueueChatCommand({ cmd: "list-sessions" });
+  });
+  // Switch the chat to a specific historical session (loads its transcript).
+  ipcMain.on("pet:chat-select-session", (_e, sessionId) => {
+    if (typeof sessionId === "string" && sessionId) {
+      enqueueChatCommand({ cmd: "select-session", sessionId });
+    }
   });
 
   ipcMain.on("pet:quit", () => app.quit());

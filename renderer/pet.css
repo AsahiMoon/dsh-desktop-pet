@@ -206,7 +206,8 @@ body[data-settings] #stage {
   to { transform: scale(1); opacity: 1; }
 }
 
-/* chat window mode (separate BrowserWindow with ?chat=1) */
+/* chat window mode (separate BrowserWindow with ?chat=1) — legacy fallback,
+   no longer produced by main.js (the panel lives in the pet window now). */
 body[data-chat] {
   background: #0f1630;
   display: flex;
@@ -227,38 +228,101 @@ body[data-chat] #statusbar {
   display: none !important;
 }
 
+/* In-pet-window chat panel: the pet window grows to CHAT_W x CHAT_H when the
+   panel opens; the sprite stays at its top-left corner and the panel is laid
+   out in the RIGHT portion (and full height) of the grown window. */
 #chat {
-  position: relative;
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 300px;
   display: flex;
   flex-direction: column;
-  width: 100%;
-  height: 100%;
-  max-height: 100vh;
   color: #eafffa;
   font: 14px/1.6 "Microsoft YaHei", sans-serif;
   background: linear-gradient(180deg, #121b3e 0%, #0f1630 100%);
   overflow: hidden;
+  border-left: 1px solid rgba(97, 122, 189, 0.25);
+  user-select: text;
+  cursor: default;
+  z-index: 30;
 }
 #chat .chat-title {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 10px 14px;
+  gap: 6px;
+  padding: 8px 10px;
   font-weight: 600;
-  font-size: 14px;
+  font-size: 13px;
   border-bottom: 1px solid rgba(97, 122, 189, 0.25);
   flex: 0 0 auto;
+}
+#chat .chat-title #chat-title-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #chat .chat-title button {
   border: none;
   background: transparent;
   color: rgba(234, 255, 250, 0.7);
-  font-size: 15px;
+  font-size: 14px;
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 6px;
 }
 #chat .chat-title button:hover { background: rgba(57, 197, 187, 0.25); }
+#chat .chat-title .chat-session-btn { font-size: 15px; }
+
+/* session picker list (toggle via 🗂️) */
+#chat .chat-sessions {
+  flex: 0 0 auto;
+  max-height: 180px;
+  overflow-y: auto;
+  border-bottom: 1px solid rgba(97, 122, 189, 0.25);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  background: rgba(10, 14, 32, 0.6);
+}
+#chat .chat-session-row {
+  text-align: left;
+  border: none;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.06);
+  color: #eafffa;
+  font: 12px/1.5 "Microsoft YaHei", sans-serif;
+  padding: 6px 8px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+#chat .chat-session-row:hover { background: rgba(57, 197, 187, 0.2); }
+#chat .chat-session-row.active { background: rgba(57, 197, 187, 0.35); }
+#chat .chat-session-title {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#chat .chat-session-preview {
+  font-size: 11px;
+  color: rgba(234, 255, 250, 0.55);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#chat .chat-session-empty {
+  font-size: 12px;
+  color: rgba(234, 255, 250, 0.5);
+  padding: 8px;
+  text-align: center;
+}
 
 #chat .chat-messages {
   flex: 1 1 auto;

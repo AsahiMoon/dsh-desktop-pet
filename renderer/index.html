@@ -33,7 +33,12 @@
       <button id="settings-close">完成</button>
     </div>
     <div id="chat" class="hidden" role="dialog" aria-label="对话">
-      <div class="chat-title">💬 与 Agent 对话 <button id="chat-close" aria-label="关闭">✕</button></div>
+      <div class="chat-title">
+        <button id="chat-session-picker" class="chat-session-btn" title="选择历史会话">🗂️</button>
+        <span id="chat-title-label">与 Agent 对话</span>
+        <button id="chat-close" aria-label="关闭">✕</button>
+      </div>
+      <div id="chat-sessions" class="chat-sessions hidden"></div>
       <div id="chat-messages" class="chat-messages"></div>
       <div class="chat-input-row">
         <textarea id="chat-input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行…"></textarea>
