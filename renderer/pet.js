@@ -1231,6 +1231,7 @@ function bootChat() {
 
   let busy = false;
   let assistantBubble = null; // the in-progress assistant bubble being streamed
+  let streamingText = ""; // raw markdown source accumulated from deltas
   let history = []; // [{ role: 'user' | 'assistant', text }]
   let sessions = []; // [{ id, title, preview, createdAt }]
   let currentSessionId = null;
@@ -1383,7 +1384,9 @@ function bootChat() {
     row.className = `chat-row chat-${role}`;
     const bubbleEl = document.createElement("div");
     bubbleEl.className = "chat-bubble";
-    bubbleEl.textContent = text;
+    // markdown body — the renderer escapes HTML first, so this is safe
+    if (window.PetMarkdown) bubbleEl.innerHTML = window.PetMarkdown.render(text);
+    else bubbleEl.textContent = text; // safe fallback (plain text)
     row.append(bubbleEl);
     messagesEl.append(row);
     if (nearBottom()) messagesEl.scrollTop = messagesEl.scrollHeight;
@@ -1643,15 +1646,21 @@ function bootChat() {
       if (!assistantBubble) {
         const row = appendRow("assistant", "");
         assistantBubble = row.bubbleEl;
+        streamingText = "";
       }
-      assistantBubble.textContent += signal.text ?? "";
+      streamingText += signal.text ?? "";
+      // re-render the accumulated markdown so formatting appears live
+      if (window.PetMarkdown) assistantBubble.innerHTML = window.PetMarkdown.render(streamingText);
+      else assistantBubble.textContent = streamingText;
       if (nearBottom()) messagesEl.scrollTop = messagesEl.scrollHeight;
     } else if (kind === "assistant") {
       // full assembled reply replaces the streaming bubble (identical text)
       history.push({ role: "assistant", text: signal.text ?? "" });
       if (assistantBubble) {
-        assistantBubble.textContent = signal.text ?? "";
+        if (window.PetMarkdown) assistantBubble.innerHTML = window.PetMarkdown.render(signal.text ?? "");
+        else assistantBubble.textContent = signal.text ?? "";
         assistantBubble = null;
+        streamingText = "";
       } else {
         appendRow("assistant", signal.text ?? "");
       }

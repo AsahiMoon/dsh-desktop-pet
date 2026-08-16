@@ -823,6 +823,19 @@ function createWindow() {
   win.webContents.on("render-process-gone", (_e, details) => {
     console.error(`[renderer] process gone: ${details.reason}`);
   });
+  // markdown links open in the system browser — the pet window must never
+  // navigate away or spawn an untitled Electron window on a link click
+  const openExternal = (url) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+  };
+  win.webContents.setWindowOpenHandler(({ url }) => {
+    openExternal(url);
+    return { action: "deny" };
+  });
+  win.webContents.on("will-navigate", (e, url) => {
+    openExternal(url);
+    e.preventDefault();
+  });
   if (process.argv.includes("--dev")) {
     win.webContents.openDevTools({ mode: "detach" });
   }
@@ -1145,6 +1158,14 @@ function openSettingsWindow() {
   settingsWin.loadFile(path.join(ROOT, "renderer", "index.html"), { query: { settings: "1" } });
   settingsWin.webContents.on("console-message", (_e, level, message, line, sourceId) => {
     console.log(`[settings:${level}] ${message} (${sourceId}:${line})`);
+  });
+  settingsWin.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: "deny" };
+  });
+  settingsWin.webContents.on("will-navigate", (e, url) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    e.preventDefault();
   });
 }
 function closeSettingsWindow() {

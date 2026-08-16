@@ -166,6 +166,24 @@ app.whenReady().then(async () => {
   const afterRetry = await evaljs(`document.querySelector(".chat-messages .chat-session-empty")?.textContent ?? ""`);
   check("retry click re-shows the loading placeholder", afterRetry.includes("正在加载"), afterRetry);
 
+  // ---- 7) MARKDOWN: assistant bubbles render markdown, not raw text ----
+  sig("assistant", { text: "# 标题\n\n这是**加粗**、`code` 和 [链接](https://example.com)\n\n```js\nconst x = 1 < 2;\n```" });
+  await sleep(60);
+  const md = JSON.parse(await evaljs(`JSON.stringify({
+    h1: !!document.querySelector(".chat-assistant .chat-bubble h1"),
+    strong: !!document.querySelector(".chat-assistant .chat-bubble strong"),
+    code: !!document.querySelector(".chat-assistant .chat-bubble code"),
+    a: document.querySelector(".chat-assistant .chat-bubble a")?.getAttribute("href") ?? "",
+    pre: !!document.querySelector(".chat-assistant .chat-bubble pre code"),
+    rawStars: document.querySelector(".chat-assistant .chat-bubble")?.textContent.includes("**"),
+  })`));
+  check("markdown heading rendered", md.h1 === true);
+  check("markdown bold rendered", md.strong === true);
+  check("markdown inline code rendered", md.code === true);
+  check("markdown link rendered", md.a === "https://example.com", md.a);
+  check("markdown fenced code block rendered", md.pre === true);
+  check("no raw markdown markers leak", md.rawStars === false);
+
   console.log(failures === 0 ? "\nALL PROBES PASSED" : `\n${failures} PROBE(S) FAILED`);
   app.exit(failures === 0 ? 0 : 1);
 }).catch((e) => {
