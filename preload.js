@@ -45,6 +45,12 @@ contextBridge.exposeInMainWorld("petAPI", {
   onMenuAction: (cb) => {
     ipcRenderer.on("pet:menu-action", (_event, act) => cb(act));
   },
+  /** Open the separate chat window (talk to the DSH agent). */
+  openChat: () => ipcRenderer.send("pet:chat-open"),
+  /** Close the separate chat window. */
+  closeChat: () => ipcRenderer.send("pet:chat-close"),
+  /** Submit one prompt to the DSH agent through the plugin chat bridge. */
+  sendChat: (text) => ipcRenderer.invoke("pet:chat-send", text),
   /** Quit the app. */
   quit: () => ipcRenderer.send("pet:quit"),
 });

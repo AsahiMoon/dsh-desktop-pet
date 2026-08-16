@@ -13,12 +13,18 @@
  *    behavior without a restart.
  * 3. Spawn the Electron pet window on boot (the pet's own single-instance
  *    lock keeps a manually started window from being duplicated).
+ * 4. Serve a local chat bridge: the pet window POSTs user prompts to
+ *    http://127.0.0.1:43992/prompt; this half submits them to the active
+ *    agent via agent.followup() and forwards the agent's streamed reply back
+ *    over the 43991 signal channel as chat signals.
  *
  * The pet window also works standalone without this plugin (local autonomous
  * behavior, config from its own config.json); the plugin adds the agent-state
  * sync channel and the settings-backed hot config.
  */
 import { spawn } from "node:child_process";
+import http from "node:http";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -31,6 +37,9 @@ export const inject = ["jobs", "sessions", "agents", "settings"];
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 43991;
 const HOST = "127.0.0.1";
+/** Inbound chat-prompt listener (the pet window POSTs user input here). */
+const CHAT_PORT = 43992;
+const CHAT_HOST = "127.0.0.1";
 
 /** Resolve an executable that can run main.js: the electron package when it is
  *  installed anywhere up the node_modules tree (dev setups, local installs),
@@ -100,6 +109,28 @@ async function sendSignal(signal) {
   }
 }
 
+/** Construct one identified user message the agent loop accepts.
+ *  Plain JSON on purpose: this bundle cannot resolve @deepseek-ai/dsh-llm
+ *  from its link-installed location, and the inbox/session layers only
+ *  require a JSON-serializable message with a unique id. */
+function createChatUserMessage(text) {
+  return {
+    id: crypto.randomUUID(),
+    role: "user",
+    content: [{ type: "text", text }],
+    source: { kind: "user" },
+  };
+}
+
+/** Extract the visible text of an assistant message's content blocks. */
+function textOfBlocks(content) {
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text)
+    .join("");
+}
+
 // Crash recovery: a spawned pet that dies unexpectedly (non-zero exit) is
 // restarted with a small backoff, capped so a hard-failing install does not
 // respawn forever. A zero exit is a deliberate quit (tray -> 退出) and never
@@ -146,6 +177,132 @@ function ensurePet() {
  */
 export function apply(ctx) {
   ensurePet();
+
+  // ---- chat bridge: receive prompts from the pet window, forward replies ----
+  // The pet window POSTs { text } to http://127.0.0.1:43992/prompt. We route
+  // it to the most recently active agent (or resume the most recent persisted
+  // session when no agent is live yet) via agent.followup(); the agent's
+  // streamed reply comes back through session/event and is pushed over the
+  // existing 43991 signal channel as chat signals ({ type: 'chat', ... }).
+  let chatTargetAgent = null;
+  let chatStreaming = false;
+  let chatStreamText = "";
+  /** Pick the agent the pet chat should talk to (live agents only). */
+  const pickLiveChatAgent = () => {
+    const agentsSvc = ctx.get("agents");
+    if (!agentsSvc || typeof agentsSvc.list !== "function") return undefined;
+    const live = agentsSvc.list();
+    if (live.length === 0) return undefined;
+    const roots = agentsSvc.roots?.() ?? [];
+    // Prefer the agent currently driving the pet (most recent activity),
+    // then the first root agent (web sessions are roots).
+    return live.find((a) => a.id === activeSessionId)
+      ?? (roots[0] ?? live[0]);
+  };
+  /** Resume the most recent persisted session as a live agent (best-effort). */
+  const resumeRecentAgent = async () => {
+    try {
+      const agentsSvc = ctx.get("agents");
+      const persistence = ctx.get("sessionPersistence");
+      if (!agentsSvc || typeof agentsSvc.resume !== "function") return undefined;
+      if (!persistence || typeof persistence.list !== "function") return undefined;
+      const headers = await persistence.list();
+      if (!Array.isArray(headers) || headers.length === 0) return undefined;
+      // Most recent first (headers carry createdAt).
+      const latest = [...headers].sort((a, b) =>
+        new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+      )[0];
+      const handle = await agentsSvc.resume({ resumeSessionId: latest.id });
+      if (!handle?.agent) return undefined;
+      // Resume can only build a fresh agent once; keep the handle's dispose
+      // out of our own teardown (the loop owns it structurally).
+      return handle.agent;
+    } catch (err) {
+      console.error("[dsh-desktop-pet] resume failed:", err?.message ?? err);
+      return undefined;
+    }
+  };
+  /** Resolve the chat target: live agent first, else resume the latest session. */
+  const resolveChatAgent = async () => {
+    const live = pickLiveChatAgent();
+    if (live) return live;
+    return resumeRecentAgent();
+  };
+  /** Submit one prompt from the pet window to the chosen agent. */
+  const submitChatPrompt = async (text) => {
+    const agent = await resolveChatAgent();
+    if (!agent || typeof agent.followup !== "function") {
+      sendSignal({ type: "chat", kind: "error", text: "没有可对话的 Agent（请先在网页里打开一个会话）" });
+      return false;
+    }
+    chatTargetAgent = agent;
+    chatStreaming = false;
+    chatStreamText = "";
+    try {
+      agent.followup(createChatUserMessage(text));
+      return true;
+    } catch (err) {
+      console.error("[dsh-desktop-pet] followup failed:", err?.message ?? err);
+      sendSignal({ type: "chat", kind: "error", text: `提交失败：${err?.message ?? err}` });
+      return false;
+    }
+  };
+  /** Is this event from the agent the pet chat is talking to? */
+  const isChatSession = (sessionId) => (
+    chatTargetAgent !== null && sessionId != null && sessionId === chatTargetAgent.id
+  );
+  /** Stream one assistant text delta to the pet chat window. */
+  const chatDelta = (text) => {
+    if (!text) return;
+    chatStreaming = true;
+    chatStreamText += text;
+    sendSignal({ type: "chat", kind: "delta", text });
+  };
+  /** Close the current assistant stream (full accumulated text + done). */
+  const chatStreamEnd = () => {
+    if (!chatStreaming) return;
+    chatStreaming = false;
+    sendSignal({ type: "chat", kind: "assistant", text: chatStreamText });
+    chatStreamText = "";
+  };
+
+  const chatServer = http.createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/prompt") {
+      res.writeHead(404, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "not found" }));
+      return;
+    }
+    let body = "";
+    req.on("data", (chunk) => {
+      body += chunk;
+      if (body.length > 64 * 1024) req.destroy();
+    });
+    req.on("end", () => {
+      try {
+        const payload = JSON.parse(body);
+        const text = typeof payload?.text === "string" ? payload.text.trim() : "";
+        if (!text) {
+          res.writeHead(400, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: "empty prompt" }));
+          return;
+        }
+        // submitChatPrompt is now async (may resume a persisted session).
+        void submitChatPrompt(text).then((ok) => {
+          res.writeHead(ok ? 200 : 409, { "content-type": "application/json" });
+          res.end(JSON.stringify({ ok }));
+        });
+      } catch (e) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+    });
+  });
+  chatServer.on("error", (err) => {
+    console.error("[dsh-desktop-pet] chat server error:", err?.message ?? err);
+  });
+  chatServer.listen(CHAT_PORT, CHAT_HOST, () => {
+    console.log(`[dsh-desktop-pet] chat bridge listening on ${CHAT_HOST}:${CHAT_PORT}`);
+  });
 
   // ---- config: register with DSH settings, hot-push on change ----
   const settings = typeof ctx.get === "function" ? ctx.get("settings") : undefined;
@@ -285,6 +442,28 @@ export function apply(ctx) {
     // Session log edges drive think / exec / todo / wait / celebrate.
     // Event shape (dsh-session SessionEventMap): { type, seq, time, data }.
     ctx.on("session/event", (session, event) => {
+      // Chat reply forwarding first: this session's assistant stream feeds the
+      // pet chat window (user/message echo + text-delta stream + assembled reply).
+      if (isChatSession(session?.id)) {
+        const type = event?.type;
+        if (type === "user/message") {
+          const text = textOfBlocks(event?.data?.content);
+          if (text) sendSignal({ type: "chat", kind: "user", text });
+        } else if (type === "assistant/chunk") {
+          const chunk = event?.data?.chunk;
+          if (chunk?.type === "text-delta" && typeof chunk.text === "string") {
+            chatDelta(chunk.text);
+          }
+        } else if (type === "assistant/message") {
+          chatStreamEnd();
+          const text = textOfBlocks(event?.data?.message?.content);
+          if (text) sendSignal({ type: "chat", kind: "assistant", text });
+        } else if (type === "turn/end") {
+          chatStreamEnd();
+          sendSignal({ type: "chat", kind: "done" });
+        }
+      }
+
       if (!isCurrentSession(session?.id)) return;
       const type = event?.type;
       if (type === "turn/start") {
@@ -346,6 +525,7 @@ export function apply(ctx) {
     clearInterval(heartbeat);
     clearTimeout(petRespawnTimer);
     clearTimeout(petRespawnResetTimer);
+    chatServer.close();
     // note: the spawned pet is NOT killed here — the user may want it to keep
     // running when the plugin unloads (e.g. dsh web restarts)
     for (const dispose of disposers) {

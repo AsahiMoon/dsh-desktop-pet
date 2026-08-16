@@ -64,6 +64,9 @@ const C = window.PetCore;
 // behavior: the settings window must not process agent signals (STATES is
 // null there — a state flip would crash), drag the pet, or touch the ledger.
 const SETTINGS_MODE = typeof location !== "undefined" && new URLSearchParams(location.search).get("settings") === "1";
+// chat window mode: rendered with ?chat=1 — a message list + input box for
+// talking to the DSH agent, no pet sprite, no agent state flips.
+const CHAT_MODE = typeof location !== "undefined" && new URLSearchParams(location.search).get("chat") === "1";
 
 // ---------------------------------------------------------------------------
 // config application (hot, from signals or boot)
@@ -507,6 +510,11 @@ function onMenuAction(act) {
     openSettings();
     return;
   }
+  if (act === "chat") {
+    // pet window: open the separate chat window
+    window.petAPI.openChat();
+    return;
+  }
   lastInteractAt = Date.now();
   // codex pets often lack eat/play/joy tracks — fall back to the celebrate
   // (bounce) animation so feeding/playing still gives clear visual feedback
@@ -694,6 +702,7 @@ function availableActions() {
   if (hasDistinct("eat")) actions.push("feed");
   if (hasDistinct("play")) actions.push("play");
   actions.push("cheer");
+  actions.push("chat");
   actions.push(CONFIG.taskBarPersistent ? "task-off" : "task-on");
   actions.push(CONFIG.taskBarDetailed ? "detail-off" : "detail-on");
   actions.push("sep", "settings", "bottom", "pierce", "sep", "quit");
@@ -997,8 +1006,8 @@ function handleSignal(signal) {
 // The settings window must NOT process agent signals: STATES is never loaded
 // there, so any state-driving signal (celebrate/exec/error…) would crash the
 // renderer on playState(STATES[name]) — and the pet itself already handles
-// every signal.
-if (!SETTINGS_MODE && window.petAPI && typeof window.petAPI.onSignal === "function") {
+// every signal. The chat window likewise processes ONLY chat signals.
+if (!SETTINGS_MODE && !CHAT_MODE && window.petAPI && typeof window.petAPI.onSignal === "function") {
   window.petAPI.onSignal(handleSignal);
 }
 
@@ -1015,7 +1024,8 @@ function saveLedgerSoon() {
 setInterval(() => {
   // The settings window runs this same renderer with a FRESH default ledger —
   // it must never tick or persist growth data (main.js also rejects its saves).
-  if (SETTINGS_MODE) return;
+  // The chat window likewise must not tick (it has no pet).
+  if (SETTINGS_MODE || CHAT_MODE) return;
   ledger.activeMs += TICK_ACTIVE_MS;
   const unlocked = C.checkTitles(ledger); // returns newly unlocked title names
   if (unlocked.length) bubble(`🏅 获得称号：${unlocked.join("、")}`);
@@ -1092,6 +1102,14 @@ async function boot() {
     return;
   }
 
+  if (CHAT_MODE) {
+    // separate chat window: message list + input box, no pet sprite.
+    document.body.dataset.chat = "";
+    document.getElementById("chat").classList.remove("hidden");
+    bootChat();
+    return;
+  }
+
   // load the active character's manifest (fallback states if it fails)
   try {
     await loadCharacter(CONFIG.character || "whale-girl");
@@ -1124,6 +1142,126 @@ async function boot() {
   setInterval(tickIdle, 5000);
   setInterval(maybeWalk, 5000);
   setInterval(() => saveLedgerSoon(), 30000);
+}
+
+// ---------------------------------------------------------------------------
+// chat window mode (?chat=1) — talk to the DSH agent without the web UI.
+// Messages echo locally on send; the plugin streams assistant text back as
+// chat signals (kind: user / delta / assistant / done / error).
+// ---------------------------------------------------------------------------
+function bootChat() {
+  const messagesEl = document.getElementById("chat-messages");
+  const inputEl = document.getElementById("chat-input");
+  const sendBtn = document.getElementById("chat-send");
+  const hintEl = document.getElementById("chat-hint");
+  const closeBtn = document.getElementById("chat-close");
+
+  let busy = false;
+  let assistantBubble = null; // the in-progress assistant bubble being streamed
+  let history = []; // [{ role: 'user' | 'assistant', text }]
+
+  /** Append one message row; returns the row element (for streaming). */
+  const appendRow = (role, text) => {
+    const row = document.createElement("div");
+    row.className = `chat-row chat-${role}`;
+    const bubbleEl = document.createElement("div");
+    bubbleEl.className = "chat-bubble";
+    bubbleEl.textContent = text;
+    row.append(bubbleEl);
+    messagesEl.append(row);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+    return { row, bubbleEl };
+  };
+
+  /** Render all buffered history (used on boot for a fresh window). */
+  const renderHistory = () => {
+    messagesEl.innerHTML = "";
+    for (const item of history) appendRow(item.role, item.text);
+  };
+
+  /** Handle one chat signal from the plugin. */
+  const onChatSignal = (signal) => {
+    if (!signal || signal.type !== "chat") return;
+    const kind = signal.kind;
+    if (kind === "user") {
+      history.push({ role: "user", text: signal.text ?? "" });
+      appendRow("user", signal.text ?? "");
+    } else if (kind === "delta") {
+      if (!assistantBubble) {
+        const row = appendRow("assistant", "");
+        assistantBubble = row.bubbleEl;
+      }
+      assistantBubble.textContent += signal.text ?? "";
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    } else if (kind === "assistant") {
+      // full assembled reply replaces the streaming bubble (identical text)
+      history.push({ role: "assistant", text: signal.text ?? "" });
+      if (assistantBubble) {
+        assistantBubble.textContent = signal.text ?? "";
+        assistantBubble = null;
+      } else {
+        appendRow("assistant", signal.text ?? "");
+      }
+    } else if (kind === "done") {
+      assistantBubble = null;
+      busy = false;
+      setHint("");
+      if (inputEl) inputEl.disabled = false;
+      if (sendBtn) sendBtn.disabled = false;
+      if (inputEl) inputEl.focus();
+    } else if (kind === "error") {
+      history.push({ role: "assistant", text: `⚠️ ${signal.text ?? "出错了"}` });
+      appendRow("assistant", `⚠️ ${signal.text ?? "出错了"}`);
+      assistantBubble = null;
+      busy = false;
+      setHint("");
+      if (inputEl) inputEl.disabled = false;
+      if (sendBtn) sendBtn.disabled = false;
+    }
+  };
+
+  const setHint = (text) => {
+    if (hintEl) hintEl.textContent = text;
+  };
+
+  /** Submit the current input to the agent. */
+  const send = async () => {
+    if (busy) return;
+    const text = inputEl.value.trim();
+    if (!text) return;
+    inputEl.value = "";
+    history.push({ role: "user", text });
+    appendRow("user", text);
+    busy = true;
+    assistantBubble = null;
+    if (inputEl) inputEl.disabled = true;
+    if (sendBtn) sendBtn.disabled = true;
+    setHint("⏳ Agent 思考中…");
+    const result = await window.petAPI.sendChat(text);
+    if (!result?.ok) {
+      const errText = result?.error ?? "无法连接 Agent（插件桥未启动）";
+      history.push({ role: "assistant", text: `⚠️ ${errText}` });
+      appendRow("assistant", `⚠️ ${errText}`);
+      busy = false;
+      setHint("");
+      if (inputEl) inputEl.disabled = false;
+      if (sendBtn) sendBtn.disabled = false;
+    }
+  };
+
+  if (window.petAPI && typeof window.petAPI.onSignal === "function") {
+    window.petAPI.onSignal(onChatSignal);
+  }
+  sendBtn.addEventListener("click", send);
+  inputEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  });
+  closeBtn.addEventListener("click", () => window.petAPI.closeChat());
+  setHint("💬 在下方输入消息，和 Agent 对话（无需打开网页）");
+  inputEl.focus();
 }
 
 boot();

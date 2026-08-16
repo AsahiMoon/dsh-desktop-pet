@@ -85,6 +85,9 @@ const CONFIG_FILE = () => path.join(app.getPath("userData"), "config.json");
 // Local HTTP signal channel shared with the dsh-desktop-pet bundle Node half.
 const SIGNAL_PORT = 43991;
 const SIGNAL_HOST = "127.0.0.1";
+// Inbound chat-prompt listener (plugin Node half; see index.mjs CHAT_PORT).
+const CHAT_PORT = 43992;
+const CHAT_HOST = "127.0.0.1";
 
 // Default config — keep in sync with config.mjs DEFAULTS (the DSH settings
 // schema source of truth; this copy serves the standalone app).
@@ -794,6 +797,7 @@ function refreshTrayMenu() {
   if (!tray) return;
   const menu = Menu.buildFromTemplate([
     { label: "显示 / 隐藏", click: () => toggleWindow() },
+    { label: "💬 对话", click: () => openChatWindow() },
     { label: "回到右下角", click: () => {
       if (!win) return;
       const pos = defaultPosition();
@@ -827,6 +831,68 @@ function toggleWindow() {
   if (!win) return;
   if (win.isVisible()) win.hide();
   else win.show();
+}
+
+// ---------------------------------------------------------------------------
+// chat window: a SEPARATE window for talking to the DSH agent. The pet window
+// itself never grows; the chat panel lives in its own BrowserWindow (the
+// same renderer in ?chat=1 mode). Prompts are POSTed to the plugin Node
+// half's local bridge; replies stream back as chat signals over broadcast().
+// ---------------------------------------------------------------------------
+let chatWin = null;
+function openChatWindow() {
+  if (chatWin && !chatWin.isDestroyed()) {
+    chatWin.show();
+    chatWin.focus();
+    return;
+  }
+  chatWin = new BrowserWindow({
+    width: 460,
+    height: 620,
+    minWidth: 340,
+    minHeight: 420,
+    title: "DSH Desktop Pet 对话",
+    resizable: true,
+    minimizable: true,
+    maximizable: true,
+    fullscreenable: false,
+    alwaysOnTop: false,
+    skipTaskbar: false,
+    icon: WINDOW_ICON(),
+    backgroundColor: "#0f1630",
+    webPreferences: {
+      preload: path.join(ROOT, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+      backgroundThrottling: false,
+    },
+  });
+  chatWin.setMenuBarVisibility(false);
+  chatWin.on("closed", () => {
+    chatWin = null;
+  });
+  chatWin.loadFile(path.join(ROOT, "renderer", "index.html"), { query: { chat: "1" } });
+  chatWin.webContents.on("console-message", (_e, level, message, line, sourceId) => {
+    console.log(`[chat:${level}] ${message} (${sourceId}:${line})`);
+  });
+}
+function closeChatWindow() {
+  if (chatWin && !chatWin.isDestroyed()) chatWin.close();
+}
+/** Submit one user prompt to the plugin chat bridge (best-effort). */
+async function sendChatPrompt(text) {
+  try {
+    const res = await fetch(`http://${CHAT_HOST}:${CHAT_PORT}/prompt`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    return { ok: res.ok, error: payload.error ?? null };
+  } catch (err) {
+    return { ok: false, error: err?.message ?? String(err) };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -883,9 +949,9 @@ function closeSettingsWindow() {
 // sprite — hover or persistent via the menu / settings; no popup window)
 // ---------------------------------------------------------------------------
 
-/** Deliver a signal to every window (pet + settings). */
+/** Deliver a signal to every window (pet + settings + chat). */
 function broadcast(signal) {
-  for (const w of [win, settingsWin]) {
+  for (const w of [win, settingsWin, chatWin]) {
     if (w && !w.isDestroyed()) {
       try {
         w.webContents.send("pet:signal", signal);
@@ -1042,6 +1108,7 @@ function setupIpc() {
     feed: { label: "🍗 喂食" },
     play: { label: "🎾 玩耍" },
     cheer: { label: "🎉 庆祝" },
+    chat: { label: "💬 对话" },
     "task-on": { label: "📋 常驻任务进度" },
     "task-off": { label: "📋 关闭任务进度" },
     "detail-on": { label: "📋 详细进度" },
@@ -1094,6 +1161,14 @@ function setupIpc() {
   // settings: a SEPARATE window — the pet window itself never enlarges
   ipcMain.on("pet:panel-open", () => openSettingsWindow());
   ipcMain.on("pet:panel-close", () => closeSettingsWindow());
+
+  // chat: a separate window to talk to the DSH agent
+  ipcMain.on("pet:chat-open", () => openChatWindow());
+  ipcMain.on("pet:chat-close", () => closeChatWindow());
+  ipcMain.handle("pet:chat-send", async (_e, text) => {
+    if (typeof text !== "string" || !text.trim()) return { ok: false, error: "empty" };
+    return sendChatPrompt(text.trim());
+  });
 
   ipcMain.on("pet:quit", () => app.quit());
 }
