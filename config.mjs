@@ -32,7 +32,7 @@ export function buildSchema() {
     opacity: z.number().min(0.2).max(1).default(DEFAULTS.opacity),
     character: z
       .string()
-      .regex(/^[a-z0-9-]+$/)
+      .pattern(/^[a-z0-9-]+$/)
       .default(DEFAULTS.character),
     walk: z
       .object({

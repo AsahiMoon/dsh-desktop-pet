@@ -1,7 +1,10 @@
 # dsh-desktop-pet bundle patch: mounts the desktop-pet Node half into the web
 # profile. The Node half listens to agent/session events and pushes signals to
 # the Electron pet window over local UDP; it also spawns the pet on boot.
-# Install with `dsh plugin --profile web add dsh-desktop-pet`.
+# Install with `dsh plugin --profile web add @asahimoon/dsh-desktop-pet`.
+# NOTE: `name` must be the FULL package name (@asahimoon/dsh-desktop-pet);
+# the scoped package lives under node_modules/@asahimoon/, so an unscoped
+# name would make the loader fail with ERR_MODULE_NOT_FOUND.
 - insert:
     - id: dsh-desktop-pet
-      name: dsh-desktop-pet
+      name: '@asahimoon/dsh-desktop-pet'
