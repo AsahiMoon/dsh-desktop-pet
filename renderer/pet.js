@@ -1236,7 +1236,7 @@ function bootChat() {
   let sessions = []; // [{ id, title, preview, createdAt }]
   let currentSessionId = null;
   let chatInitialized = false;
-  let sessionsLoaded = false; // picker auto-revealed + refreshed on first open
+  let sessionsLoaded = false; // set true once the picker has been opened by the user (🗂️)
   // texts of messages we just sent from the pet — the plugin echoes the
   // session's user/message event, and those echoes are deduped against this
   // set (the optimistic bubble already shows the message)
@@ -1395,19 +1395,58 @@ function bootChat() {
 
   /** Render all buffered history (fresh view — always show the newest end).
    *  Tool rows are drawn as frosted tool cards (with their output when done);
-   *  consecutive tool calls collapse into one group. */
-  const renderHistory = () => {
+   *  consecutive tool calls collapse into one group.
+   *
+   *  ASYNC + CHUNKED: rendering EVERY row synchronously (each runs Markdown
+   *  through a regex-heavy parser + a DOM insertion) froze the renderer for
+   *  hundreds of ms-to-seconds on a long conversation — the whole pet window
+   *  stalled "until the dialog loaded". Instead, show a loading placeholder
+   *  immediately, then render rows in small batches across animation frames
+   *  (yielding the main thread between batches), so the window stays
+   *  responsive while history fills in. A per-render token cancels a stale
+   *  render when a newer history arrives mid-flight. */
+  let renderToken = 0;
+  const RENDER_BATCH = 24; // rows per animation frame
+  const renderHistory = (afterRender) => {
     messagesEl.innerHTML = "";
     sealToolRun();
-    for (const item of history) {
-      if (item.role === "tool") {
-        appendToolCard(item);
-        if (item.done) finishToolCard(item);
-      } else {
-        appendRow(item.role, item.text);
-      }
+    const items = history;
+    // A loading placeholder is shown ONLY when there are rows to draw AND it
+    // would take more than one frame; an empty history skips straight to the
+    // empty-state note so tiny sessions never flash the placeholder.
+    if (items.length > RENDER_BATCH) {
+      const loading = document.createElement("div");
+      loading.className = "chat-session-empty chat-history-loading";
+      loading.textContent = "⏳ 正在渲染历史对话…";
+      messagesEl.append(loading);
     }
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    const token = ++renderToken;
+    let i = 0;
+    const renderBatch = () => {
+      if (token !== renderToken) return; // superseded by a newer history
+      // remove the placeholder on the first real batch
+      if (i === 0) messagesEl.querySelector(".chat-history-loading")?.remove();
+      const end = Math.min(i + RENDER_BATCH, items.length);
+      for (; i < end; i++) {
+        const item = items[i];
+        if (item.role === "tool") {
+          appendToolCard(item);
+          if (item.done) finishToolCard(item);
+        } else {
+          appendRow(item.role, item.text);
+        }
+      }
+      // keep the latest content in view as rows stream in (only while near the
+      // bottom — same rule appendRow/finishToolCard use during live streaming)
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (i < items.length) {
+        requestAnimationFrame(renderBatch);
+      } else if (typeof afterRender === "function") {
+        afterRender();
+      }
+    };
+    if (items.length) requestAnimationFrame(renderBatch);
+    else if (typeof afterRender === "function") afterRender();
   };
 
   /** Replace history with one session's transcript rows (user/assistant text +
@@ -1431,20 +1470,25 @@ function bootChat() {
       }
       return { role: r.role === "user" ? "user" : "assistant", text: r.text ?? "" };
     }) : [];
-    renderHistory();
-    if (truncated && truncated.skipped > 0) {
-      const note = document.createElement("div");
-      note.className = "chat-truncated-note";
-      note.textContent = `⏳ 该会话较早/较长，仅显示最近 ${history.length} 条记录（已省略 ${truncated.skipped} 条更早的）`;
-      messagesEl.prepend(note);
-    }
-    if (!history.length) {
-      // explicit empty state — a blank transcript reads as "history missing"
-      const empty = document.createElement("div");
-      empty.className = "chat-session-empty";
-      empty.textContent = "该会话暂无消息记录";
-      messagesEl.append(empty);
-    }
+    // truncated note + empty-state are appended AFTER the chunked render
+    // completes, so the loading placeholder isn't hidden by `prepend`/`append`
+    // ordering during streaming. renderHistory runs async and calls afterRender;
+    // a stale render (newer history arrived) is already canceled by renderToken,
+    // so this afterRender only runs for the CURRENT history.
+    renderHistory(() => {
+      if (truncated && truncated.skipped > 0) {
+        const note = document.createElement("div");
+        note.className = "chat-truncated-note";
+        note.textContent = `⏳ 该会话较早/较长，仅显示最近 ${history.length} 条记录（已省略 ${truncated.skipped} 条更早的）`;
+        messagesEl.prepend(note);
+      }
+      if (!history.length) {
+        const empty = document.createElement("div");
+        empty.className = "chat-session-empty";
+        empty.textContent = "该会话暂无消息记录";
+        messagesEl.append(empty);
+      }
+    });
   };
 
   /** Pretty-print a JSON string for the card's 输入 section (fallback to the
@@ -1828,29 +1872,43 @@ function bootChat() {
           window.petAPI.onSignal(onChatSignal);
         }
       }
-      // first open: reveal the history picker (it populates in the
-      // background — the transcript below has priority on the chat queue)
-      if (!sessionsLoaded) {
-        sessionsLoaded = true;
-        sessionsEl.classList.remove("hidden");
-      }
-      // mirror the web's current conversation into the panel right away, so
-      // messages typed in the web UI show up here without any extra click.
-      // Sent FIRST so the plugin answers the transcript before the picker
-      // scan (the watchdog turns a never-arriving reply into a retry button).
-      if (window.petAPI && typeof window.petAPI.currentSession === "function") {
-        armHistoryWatchdog(null, () => window.petAPI.currentSession());
-      }
+      // BLANK first open: do NOT auto-mirror the web's current conversation —
+      // loading its full history on every open is what froze the window and
+      // felt like a wall of context the user did not ask for. The panel opens
+      // empty and asks the user to pick a history session (🗂️) or start a new
+      // one (➕); only then is a transcript loaded (and only its last 20 rows).
+      // The history picker still populates in the background so 🗂️ is ready.
+      clearTimeout(pendingLoadTimer);
+      pendingLoadId = null;
+      historyReqSeq++;
+      currentSessionId = null;
+      assistantBubble = null;
+      pendingUserEchoes.clear();
+      history = [];
+      busy = false;
+      clearTimeout(sendWatchdog);
+      // input is disabled until the user chooses a conversation to talk in
+      if (inputEl) inputEl.disabled = true;
+      if (sendBtn) sendBtn.disabled = true;
+      messagesEl.innerHTML = "";
+      const welcome = document.createElement("div");
+      welcome.className = "chat-session-empty";
+      welcome.textContent = "🐳 点 🗂️ 选择历史会话，或点 ➕ 开启新对话";
+      messagesEl.append(welcome);
+      titleLabel.textContent = "🐳 与鲸鱼娘对话";
+      if (statsEl) statsEl.textContent = "";
+      setHint("💬 先选择一个会话或开启新对话，再开始聊天");
+      // Pre-fetch the session list in the background so 🗂️ opens populated,
+      // but do NOT auto-reveal the picker on first open — the user wants a
+      // clean blank panel until they explicitly click 🗂️ to browse history.
       if (window.petAPI && typeof window.petAPI.listSessions === "function") {
         window.petAPI.listSessions();
       }
-      setHint("💬 点击 🗂️ 选择历史会话，或直接输入消息");
-      if (inputEl) inputEl.focus();
     } else {
       // closing: restore the pet's default layout (top-left, no shift)
       delete document.body.dataset.chatSide;
       document.body.style.removeProperty("--pet-shift-y");
-      // ...and drop the pinned chat target — the next open follows the web
+      // ...and drop the pinned chat target — the next open is blank again
       clearTimeout(pendingLoadTimer);
       pendingLoadId = null;
       historyReqSeq++;

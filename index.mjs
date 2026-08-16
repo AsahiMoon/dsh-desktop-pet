@@ -40,16 +40,51 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 43991;
 const HOST = "127.0.0.1";
 
-// History delivery limits: a long conversation (hundreds of tool calls /
-// messages) is heavy to decompress, serialize and render. Only the RECENT
-// tail of a transcript is sent to the pet — and older conversations get an
-// even smaller tail, so "太久远的对话" never costs a full load.
-const MAX_HISTORY_ROWS = 250; // recent conversations: keep last 250 rows
-const MAX_OLD_HISTORY_ROWS = 120; // older conversations: keep last 120
+// History delivery limits: the pet chat panel only shows the RECENT TAIL of a
+// transcript, so a long conversation is never fully decompressed, serialized
+// and rendered (which used to freeze the window). 20 rows is enough context to
+// continue a conversation without scrolling, and the panel does not load
+// earlier rows on scroll-up (by design — the same lightweight choice the pet
+// makes everywhere to stay responsive).
+const MAX_HISTORY_ROWS = 20; // recent conversations: keep last 20 rows
+const MAX_OLD_HISTORY_ROWS = 20; // older conversations: keep last 20 too
 const OLD_CONVERSATION_MS = 14 * 24 * 60 * 60 * 1000; // idle for >14 days
 // How fresh a cached session list may be before the picker re-scans storage.
 const SESSIONS_CACHE_TTL_MS = 8_000;
 const SESSIONS_POOL_LIMIT = 5; // concurrent log reads when listing sessions
+// How long one persisted-session inspect may run before the history load
+// ABORTS it (via the AbortSignal passed to persistence.inspect) and reports
+// `failed`, after which the pet offers a retry. The pet's renderer watchdog
+// is 30s, so this must sit comfortably below it to leave headroom for the
+// transcript parse + serialization + HTTP hop that follow the read.
+const HISTORY_INSPECT_TIMEOUT_MS = 20_000;
+
+/**
+ * Inspect one persisted session with a REAL abort bound. DSH's persistence
+ * `inspect(id, signal)` re-reads the stored log in a `for(;;)` loop that is
+ * only interruptible through its AbortSignal parameter; calling it without a
+ * signal leaves a slow/corrupt log to hang forever. This wrapper passes an
+ * AbortController that fires after `HISTORY_INSPECT_TIMEOUT_MS`, so the read
+ * is genuinely cancelled (not merely ignored) and the caller can report
+ * `failed` and offer a retry.
+ * @param {object} persistence the sessionPersistence service
+ * @param {string} sessionId
+ * @returns {Promise<object|undefined>} the inspection, or undefined on abort
+ */
+async function inspectWithTimeout(persistence, sessionId) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), HISTORY_INSPECT_TIMEOUT_MS);
+  try {
+    return await persistence.inspect(sessionId, controller.signal);
+  } catch (err) {
+    // Abort just means "too slow to fetch now" — surface it as undefined and
+    // let callers fall back / report failed rather than throwing.
+    if (controller.signal.aborted) return undefined;
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 /** Resolve an executable that can run main.js: the electron package when it is
  *  installed anywhere up the node_modules tree (dev setups, local installs),
@@ -308,9 +343,11 @@ export function apply(ctx) {
     try {
       const persistence = ctx.get("sessionPersistence");
       if (persistence && typeof persistence.inspect === "function") {
-        const inspection = await persistence.inspect(sessionId);
-        const t = titleOf(inspection?.events);
-        if (t) return t;
+        const inspection = await inspectWithTimeout(persistence, sessionId);
+        if (inspection !== undefined) {
+          const t = titleOf(inspection?.events);
+          if (t) return t;
+        }
       }
     } catch {
       /* not materialized yet — fall through to the live session */
@@ -365,45 +402,66 @@ export function apply(ctx) {
     try {
       const persistence = ctx.get("sessionPersistence");
       const store = ctx.get("sessions");
-      // merge both sources by session id (live wins for title/preview)
+      // The web sidebar hides ARCHIVED sessions (workspace registry's
+      // archivedSessionIds) as well as subagent children and non-current-cwd
+      // conversations. The pet picker must mirror that, or it lists sessions
+      // the web no longer shows. Best-effort: no workspaceRegistry -> no
+      // archive filtering (older harness / standalone).
+      let archivedIds = null;
+      const workspaceRegistry = ctx.get("workspaceRegistry");
+      if (workspaceRegistry && Array.isArray(workspaceRegistry.archivedSessionIds)) {
+        archivedIds = new Set(workspaceRegistry.archivedSessionIds);
+      }
+      // merge both sources by session id (live wins for title/preview).
+      // IMPORTANT: live sessions MUST be merged FIRST so their `live` reference
+      // survives — a session that is both live AND persisted keeps its live
+      // entry, so the list reads title/preview from memory (fast + accurate,
+      // same as the web UI) instead of cold-reading its log. The previous order
+      // (persistence first, `if (!byId.has(s.id))` for live) silently dropped
+      // the live reference of every persisted live session, so those sessions
+      // were cold-inspected — slow, and for an actively-writing session the
+      // inspect re-read loop could time out and drop the session from the list.
       const byId = new Map();
+      if (store && typeof store.list === "function") {
+        for (const s of store.list()) {
+          byId.set(s.id, {
+            id: s.id,
+            createdAt: s.header?.createdAt ?? Date.now(),
+            origin: s.header?.origin,
+            delegationDepth: s.header?.delegationDepth,
+            live: s,
+          });
+        }
+      }
       if (persistence && typeof persistence.list === "function") {
         const headers = await persistence.list();
         if (Array.isArray(headers)) {
           for (const h of headers) {
-            byId.set(h.id, { id: h.id, createdAt: h.createdAt, origin: h.origin, delegationDepth: h.delegationDepth });
-          }
-        }
-      }
-      if (store && typeof store.list === "function") {
-        for (const s of store.list()) {
-          if (!byId.has(s.id)) {
-            byId.set(s.id, {
-              id: s.id,
-              createdAt: s.header?.createdAt ?? Date.now(),
-              origin: s.header?.origin,
-              delegationDepth: s.header?.delegationDepth,
-              live: s,
-            });
+            if (!byId.has(h.id)) {
+              byId.set(h.id, { id: h.id, createdAt: h.createdAt, origin: h.origin, delegationDepth: h.delegationDepth });
+            }
           }
         }
       }
       const sorted = [...byId.values()]
         .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
         .slice(0, 50)
-        // the pet chat lists top-level conversations — subagent child sessions
-        // would clutter the picker with intermediate working sessions
-        .filter((entry) => entry.origin !== "subagent" && (entry.delegationDepth ?? 0) <= 0);
+        // the pet chat lists top-level conversations only — match the web
+        // sidebar by dropping subagent child sessions AND archived sessions
+        // (a user-archived conversation stays on disk but is hidden everywhere).
+        .filter((entry) => entry.origin !== "subagent" && (entry.delegationDepth ?? 0) <= 0)
+        .filter((entry) => !(archivedIds?.has(entry.id) ?? false));
+      console.log(`[dsh-desktop-pet] listSessions: ${byId.size} total ids; archived=${archivedIds ? archivedIds.size : "n/a"}; sorted=${sorted.length} after filter`);
       // persisted entries need a log read for their title/preview — run those
       // reads CONCURRENTLY (bounded pool) instead of one after another
       const persisted = sorted.filter((entry) => !entry.live && persistence && typeof persistence.inspect === "function");
       const meta = await mapPool(persisted, SESSIONS_POOL_LIMIT, async (entry) => {
         try {
-          const inspection = await persistence.inspect(entry.id);
+          const inspection = await inspectWithTimeout(persistence, entry.id);
           return {
             id: entry.id,
-            title: titleOf(inspection?.events),
-            preview: lastMessagePreview(inspection?.events),
+            title: inspection === undefined ? undefined : titleOf(inspection?.events),
+            preview: inspection === undefined ? "" : lastMessagePreview(inspection?.events),
           };
         } catch {
           return { id: entry.id, title: undefined, preview: "" };
@@ -442,6 +500,7 @@ export function apply(ctx) {
           createdAt: entry.createdAt,
         });
       }
+      console.log(`[dsh-desktop-pet] listSessions => ${rows.length} top-level sessions`);
       return rows;
     } catch (err) {
       console.error("[dsh-desktop-pet] listSessions failed:", err?.message ?? err);
@@ -529,31 +588,46 @@ export function apply(ctx) {
    *  { skipped, shown } when rows were cut; failed = the persisted read
    *  threw, so the panel can offer a retry instead of an empty view. */
   const loadTranscript = async (sessionId) => {
+    const tLoad0 = Date.now();
     const agentsSvc = ctx.get("agents");
     const store = ctx.get("sessions");
     // the store FIRST — exactly the web's historySourceFor() ordering
     const storeSession = store?.get?.(sessionId);
     const liveAgent = agentsSvc?.get?.(sessionId);
     const liveEvents = storeSession?.events ?? liveAgent?.session?.events;
+    const hasLive = Array.isArray(liveEvents) && liveEvents.length > 0;
+    console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: storeSession=${!!storeSession} liveAgent=${!!liveAgent} liveEvents=${hasLive ? liveEvents.length : 0}`);
     let rows = null;
     let title;
     let usedEvents = null;
     let failed = false;
-    if (Array.isArray(liveEvents) && liveEvents.length) {
+    if (hasLive) {
       rows = transcriptOf(liveEvents);
       title = titleOf(liveEvents);
       usedEvents = liveEvents;
+      console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: LIVE path, ${rows.length} rows in ${Date.now() - tLoad0}ms`);
     } else {
       try {
         const persistence = ctx.get("sessionPersistence");
         if (persistence && typeof persistence.inspect === "function") {
-          // NO artificial timeout: the web waits for this read too, and the
-          // coordinator caches the prepared session afterwards. A premature
-          // abort would kill a read that would otherwise succeed.
-          const inspection = await persistence.inspect(sessionId);
-          usedEvents = inspection?.events;
-          rows = transcriptOf(usedEvents);
-          title = titleOf(usedEvents);
+          // The web waits for this read with no timeout, but HERE it runs on
+          // the pet's single command path. A slow / corrupt persisted log can
+          // make `inspect(id)` never settle: DSH's coordinator `inspect` is a
+          // `for(;;)` re-read loop that is ONLY interruptible through its
+          // AbortSignal parameter. inspectWithTimeout passes one, so the read
+          // is genuinely cancelled (not just ignored), the handler reports
+          // `failed`, and the pet offers a retry.
+          const tInsp = Date.now();
+          const inspection = await inspectWithTimeout(persistence, sessionId);
+          console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: inspect returned ${inspection === undefined ? "undefined(aborted)" : (inspection?.events?.length ?? "?") + " events"} in ${Date.now() - tInsp}ms`);
+          if (inspection === undefined) {
+            // aborted (too slow) — distinct from a missing session
+            failed = true;
+          } else {
+            usedEvents = inspection?.events;
+            rows = transcriptOf(usedEvents);
+            title = titleOf(usedEvents);
+          }
         }
       } catch (err) {
         failed = true;
@@ -566,6 +640,7 @@ export function apply(ctx) {
           id: msg?.id,
         })).filter((row) => row.text);
       }
+      console.log(`[dsh-desktop-pet] loadTranscript ${sessionId}: PERSISTENCE path done, ${rows?.length ?? 0} rows, failed=${failed}, in ${Date.now() - tLoad0}ms`);
     }
     if (!Array.isArray(rows)) rows = [];
     // age-aware cap: conversations idle for a long time show even less
@@ -642,7 +717,7 @@ export function apply(ctx) {
       chatFollowSessionId = cmd.sessionId; // panel shows exactly this session
       const t0 = Date.now();
       const { rows: history, title, truncated, failed } = await loadTranscript(cmd.sessionId);
-      console.log(`[dsh-desktop-pet] select-session ${cmd.sessionId}: ${rows.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}${truncated ? ` (truncated -${truncated.skipped})` : ""}`);
+      console.log(`[dsh-desktop-pet] select-session ${cmd.sessionId}: ${history.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}${truncated ? ` (truncated -${truncated.skipped})` : ""}`);
       sendSignal({ type: "chat", kind: "history", sessionId: cmd.sessionId, rows: history, title, truncated, failed });
     } else if (cmd.cmd === "current-session") {
       // The panel opened (or reopened): mirror whatever conversation is live —
@@ -664,7 +739,7 @@ export function apply(ctx) {
       }
       const t0 = Date.now();
       const { rows: history, title, truncated, failed } = await loadTranscript(targetId);
-      console.log(`[dsh-desktop-pet] current-session ${targetId}: ${rows.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}`);
+      console.log(`[dsh-desktop-pet] current-session ${targetId}: ${history.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}`);
       sendSignal({ type: "chat", kind: "history", sessionId: targetId, rows: history, title, follow, truncated, failed });
     } else if (cmd.cmd === "reset-chat-target") {
       // The panel closed: drop the pinned target so the next open follows the
@@ -713,10 +788,16 @@ export function apply(ctx) {
   const isChatSession = (sessionId) => {
     if (sessionId == null) return false;
     const agentsSvc = ctx.get("agents");
+    // The panel only mirrors a conversation after the user EXPLICITLY picks
+    // one (history session or new session). On a BLANK first open no chat
+    // target is pinned, so live web activity must NOT stream into the empty
+    // panel — otherwise the blank state would fill with an unrequested
+    // conversation's deltas. chatTargetAgent is set by select-session /
+    // new-session / a pet-side prompt; until then, nothing forwards.
     if (chatTargetAgent !== null && agentsSvc?.get?.(chatTargetAgent.id)) {
       return sessionId === chatTargetAgent.id;
     }
-    return isCurrentSession(sessionId);
+    return false;
   };
   /** Stream one assistant text delta to the pet chat window. */
   const chatDelta = (text, sid) => {
@@ -762,7 +843,18 @@ export function apply(ctx) {
         if (payload && typeof payload === "object" && payload.cmd) {
           hadCommand = true;
           console.log("[dsh-desktop-pet] chat command:", payload?.cmd, payload?.sessionId ?? "");
-          await handleChatCommand(payload);
+          // Do NOT await the handler here: some commands (select-session /
+          // current-session) read the persisted session log, which can take
+          // many seconds (or hang) on a large/corrupt transcript. Awaiting it
+          // would park the long-poll loop on that read, so queued commands —
+          // including the user's RETRY — would never be drained, and every
+          // history load would time out in the pet. Fire-and-forget instead:
+          // the handler sends its own reply signal, and the loop immediately
+          // re-polls (hadCommand === true resets the backoff), so the next
+          // command is picked up right away regardless of the slow one.
+          handleChatCommand(payload).catch((err) => {
+            console.error("[dsh-desktop-pet] chat command failed:", payload?.cmd, err?.message ?? err);
+          });
         }
       }
     } catch (err) {
