@@ -35,7 +35,10 @@
     <div id="chat" class="hidden" role="dialog" aria-label="对话">
       <div class="chat-title">
         <button id="chat-session-picker" class="chat-session-btn" title="选择历史会话">🗂️</button>
-        <span id="chat-title-label">与 Agent 对话</span>
+        <button id="chat-new" class="chat-new-btn" title="开启新对话">➕</button>
+        <span id="chat-avatar" class="chat-avatar" aria-hidden="true"></span>
+        <span id="chat-title-label">🐳 与鲸鱼娘对话</span>
+        <button id="chat-maximize" class="chat-maximize-btn" title="最大化 / 还原面板大小">⛶</button>
         <button id="chat-close" aria-label="关闭">✕</button>
       </div>
       <div id="chat-sessions" class="chat-sessions hidden"></div>
@@ -44,7 +47,13 @@
         <textarea id="chat-input" rows="2" placeholder="输入消息，Enter 发送，Shift+Enter 换行…"></textarea>
         <button id="chat-send">发送</button>
       </div>
+      <div id="chat-stats" class="chat-stats"></div>
       <div id="chat-hint" class="chat-hint"></div>
+      <div class="chat-resize" aria-hidden="true">
+        <div class="chat-resize-edge chat-resize-left" title="拖动调整宽度"></div>
+        <div class="chat-resize-edge chat-resize-right" title="拖动调整宽度"></div>
+        <div class="chat-resize-bottom" title="拖动调整高度"></div>
+      </div>
     </div>
   </div>
   <script src="core.js"></script>

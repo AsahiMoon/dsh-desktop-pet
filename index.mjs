@@ -40,6 +40,17 @@ const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const PORT = 43991;
 const HOST = "127.0.0.1";
 
+// History delivery limits: a long conversation (hundreds of tool calls /
+// messages) is heavy to decompress, serialize and render. Only the RECENT
+// tail of a transcript is sent to the pet — and older conversations get an
+// even smaller tail, so "太久远的对话" never costs a full load.
+const MAX_HISTORY_ROWS = 250; // recent conversations: keep last 250 rows
+const MAX_OLD_HISTORY_ROWS = 120; // older conversations: keep last 120
+const OLD_CONVERSATION_MS = 14 * 24 * 60 * 60 * 1000; // idle for >14 days
+// How fresh a cached session list may be before the picker re-scans storage.
+const SESSIONS_CACHE_TTL_MS = 8_000;
+const SESSIONS_POOL_LIMIT = 5; // concurrent log reads when listing sessions
+
 /** Resolve an executable that can run main.js: the electron package when it is
  *  installed anywhere up the node_modules tree (dev setups, local installs),
  *  or the standalone installed app when electron is absent (npm-published
@@ -188,22 +199,88 @@ export function apply(ctx) {
   let chatTargetAgent = null;
   let chatStreaming = false;
   let chatStreamText = "";
+  /** The session whose transcript the pet chat panel is currently showing.
+   *  When it changes (web-side activity in a different session), the panel
+   *  first receives the new session's full transcript, then the live events. */
+  let chatFollowSessionId = null;
+  /** Per-turn token accounting for the stats line under the chat input —
+   *  reset on turn/start, accumulated from each step's assistant/message
+   *  usage, mirroring the web UI's 轮次 / token / 缓存命中 readout. */
+  let chatStats = { turn: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  const resetChatStats = (turn) => {
+    chatStats = { turn: turn ?? 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 };
+  };
   /** Text of one message's content blocks (text blocks only). */
   const messageText = (content) => textOfBlocks(content);
   /** Extract user/assistant transcript rows from a session's events.
-   *  @returns [{ role: 'user'|'assistant', text, ts }] in log order. */
+   *  Rows carry the message id so callers can tell them apart (e.g. drop the
+   *  triggering message from a follow-switch history instead of showing it
+   *  twice — once in the transcript, once as the live echo).
+   *  @returns [{ role: 'user'|'assistant'|'tool', text?, ts?, id?, tool?, ... }]
+   *           in log order. Tool rows carry the tool card payload and pair
+   *           with their result via callId, so the renderer can rebuild the
+   *           web-style tool cards when a session is reopened. */
   const transcriptOf = (events) => {
     if (!Array.isArray(events)) return [];
     const rows = [];
+    const toolByCall = new Map();
     for (const event of events) {
       if (!event || typeof event !== "object") continue;
       const data = event.data;
       if (event.type === "user/message" && data?.content) {
         const text = messageText(data.content);
-        if (text) rows.push({ role: "user", text, ts: event.time });
+        if (text) rows.push({ role: "user", text, ts: event.time, id: data?.id });
       } else if (event.type === "assistant/message" && data?.message?.content) {
         const text = messageText(data.message.content);
-        if (text) rows.push({ role: "assistant", text, ts: event.time });
+        if (text) rows.push({ role: "assistant", text, ts: event.time, id: data?.message?.id });
+      } else if (event.type === "tool/call") {
+        // a tool call row — the renderer draws it as a frosted tool card;
+        // the matching tool/result below marks it done and adds the output
+        const callId = data?.callId;
+        let summary = null;
+        let argsText = null;
+        try {
+          const args = JSON.parse(data?.arguments ?? "{}");
+          summary = toolDetailOf(data?.name, args);
+          const json = JSON.stringify(args);
+          if (json && json !== "{}") argsText = json.length > 4000 ? `${json.slice(0, 4000)}…` : json;
+        } catch {
+          /* arguments not parseable — keep header-only card */
+        }
+        const row = {
+          role: "tool",
+          callId,
+          tool: data?.name,
+          label: toolLabel(data?.name),
+          summary,
+          argsText,
+          done: false,
+        };
+        if (callId) toolByCall.set(callId, row);
+        rows.push(row);
+      } else if (event.type === "tool/result") {
+        const callId = data?.message?.source?.callId;
+        const block = data?.message?.content?.[0];
+        const isError = !!(block && block.isError);
+        let output = null;
+        const strings = [];
+        const collect = (v) => {
+          if (typeof v === "string") strings.push(v);
+          else if (Array.isArray(v)) v.forEach(collect);
+          else if (v && typeof v === "object" && "content" in v) collect(v.content);
+        };
+        collect(data?.message?.content);
+        const joined = strings.join("\n").trim();
+        if (joined) output = joined.length > 4000 ? `${joined.slice(0, 4000)}…` : joined;
+        const row = callId ? toolByCall.get(callId) : null;
+        if (row) {
+          row.done = true;
+          row.output = output;
+          row.isError = isError;
+        } else if (output) {
+          // result without a visible call row (edge case) — still show it
+          rows.push({ role: "tool", callId, tool: null, label: "工具结果", summary: null, argsText: null, done: true, output, isError });
+        }
       }
     }
     return rows;
@@ -218,31 +295,139 @@ export function apply(ctx) {
     }
     return undefined;
   };
-  /** List persisted sessions with their titles and a message preview. */
+  /** The title of one session — persisted log first, live session fallback
+   *  (a just-created session may not have a log file yet). */
+  const sessionTitle = async (sessionId) => {
+    try {
+      const persistence = ctx.get("sessionPersistence");
+      if (persistence && typeof persistence.inspect === "function") {
+        const inspection = await persistence.inspect(sessionId);
+        const t = titleOf(inspection?.events);
+        if (t) return t;
+      }
+    } catch {
+      /* not materialized yet — fall through to the live session */
+    }
+    const live = ctx.get("sessions")?.get?.(sessionId);
+    return live ? titleOf(live.events) : undefined;
+  };
+  /** Cheap preview text: the LAST user/assistant message in a log, found by
+   *  walking from the END and stopping at the first message — building the
+   *  full transcript of every listed session was what made the picker slow. */
+  const lastMessagePreview = (events) => {
+    if (!Array.isArray(events)) return "";
+    for (let i = events.length - 1; i >= 0; i--) {
+      const ev = events[i];
+      const data = ev?.data;
+      let text = null;
+      if (ev?.type === "user/message" && data?.content) text = messageText(data.content);
+      else if (ev?.type === "assistant/message" && data?.message?.content) text = messageText(data.message.content);
+      if (text) return text.slice(0, 80);
+    }
+    return "";
+  };
+  /** Timestamp of the newest event in a log (for conversation-age checks). */
+  const lastEventTs = (events) => {
+    if (!Array.isArray(events)) return undefined;
+    for (let i = events.length - 1; i >= 0; i--) {
+      if (typeof events[i]?.time === "number") return events[i].time;
+    }
+    return undefined;
+  };
+  /** Run async work over items with a bounded concurrency pool. */
+  const mapPool = async (items, limit, fn) => {
+    const out = new Array(items.length);
+    let next = 0;
+    await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(items[i], i);
+      }
+    }));
+    return out;
+  };
+  /** Short-lived cache so re-opening the picker (panel open + 🗂️ clicks)
+   *  does not re-decompress every session log each time. */
+  let sessionsCache = { at: 0, rows: [] };
+  /** List sessions with their titles and a message preview — PERSISTED ones
+   *  plus LIVE (in-memory) ones, so the pet picker matches what the web
+   *  sidebar shows: the web also lists sessions that were just created but
+   *  not yet flushed to disk (lazy materialization — a fresh "新会话" with no
+   *  message has no log file yet, so persistence.list() alone would miss it). */
   const listSessions = async () => {
     try {
       const persistence = ctx.get("sessionPersistence");
-      if (!persistence || typeof persistence.list !== "function") return [];
-      const headers = await persistence.list();
-      if (!Array.isArray(headers)) return [];
+      const store = ctx.get("sessions");
+      // merge both sources by session id (live wins for title/preview)
+      const byId = new Map();
+      if (persistence && typeof persistence.list === "function") {
+        const headers = await persistence.list();
+        if (Array.isArray(headers)) {
+          for (const h of headers) {
+            byId.set(h.id, { id: h.id, createdAt: h.createdAt, origin: h.origin, delegationDepth: h.delegationDepth });
+          }
+        }
+      }
+      if (store && typeof store.list === "function") {
+        for (const s of store.list()) {
+          if (!byId.has(s.id)) {
+            byId.set(s.id, {
+              id: s.id,
+              createdAt: s.header?.createdAt ?? Date.now(),
+              origin: s.header?.origin,
+              delegationDepth: s.header?.delegationDepth,
+              live: s,
+            });
+          }
+        }
+      }
+      const sorted = [...byId.values()]
+        .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+        .slice(0, 50)
+        // the pet chat lists top-level conversations — subagent child sessions
+        // would clutter the picker with intermediate working sessions
+        .filter((entry) => entry.origin !== "subagent" && (entry.delegationDepth ?? 0) <= 0);
+      // persisted entries need a log read for their title/preview — run those
+      // reads CONCURRENTLY (bounded pool) instead of one after another
+      const persisted = sorted.filter((entry) => !entry.live && persistence && typeof persistence.inspect === "function");
+      const meta = await mapPool(persisted, SESSIONS_POOL_LIMIT, async (entry) => {
+        try {
+          const inspection = await persistence.inspect(entry.id);
+          return {
+            id: entry.id,
+            title: titleOf(inspection?.events),
+            preview: lastMessagePreview(inspection?.events),
+          };
+        } catch {
+          return { id: entry.id, title: undefined, preview: "" };
+        }
+      });
+      const metaById = new Map(meta.map((m) => [m.id, m]));
       const rows = [];
-      for (const header of [...headers].sort((a, b) => b.createdAt - a.createdAt).slice(0, 20)) {
+      for (const entry of sorted) {
         let title;
         let preview = "";
         try {
-          if (typeof persistence.inspect === "function") {
-            const inspection = await persistence.inspect(header.id);
-            title = titleOf(inspection?.events);
-            const transcript = transcriptOf(inspection?.events);
-            const last = transcript.at(-1);
-            preview = last ? last.text.slice(0, 80) : "";
+          if (entry.live) {
+            // live session: title from its event log, preview from the
+            // derived messages (works before the first flush)
+            title = titleOf(entry.live.events);
+            const msgs = typeof entry.live.deriveMessages === "function" ? entry.live.deriveMessages() : [];
+            const last = msgs.filter((m) => m?.role === "user" || m?.role === "assistant").at(-1);
+            preview = last ? messageText(last.content).slice(0, 80) : "";
+          } else {
+            const m = metaById.get(entry.id);
+            title = m?.title;
+            preview = m?.preview ?? "";
           }
         } catch { /* keep header-only row */ }
         rows.push({
-          id: header.id,
-          title: title ?? `会话 ${header.createdAt ? new Date(header.createdAt).toLocaleString("zh-CN") : ""}`,
+          id: entry.id,
+          // no "会话" prefix — the date lives in the row's meta already, and
+          // this fallback also shows in the chat title bar
+          title: title ?? "未命名",
           preview,
-          createdAt: header.createdAt,
+          createdAt: entry.createdAt,
         });
       }
       return rows;
@@ -300,32 +485,88 @@ export function apply(ctx) {
       return undefined;
     }
   };
-  /** Resolve the chat target: live agent first, else resume the latest session. */
+  /** Resolve the chat target: the session the user selected in the pet chat
+   *  (when it is still live) FIRST, then any live agent, else resume the
+   *  latest persisted session. Previously the live-agent scan ran first, so
+   *  picking an old session and sending a message could route the prompt to a
+   *  DIFFERENT (more recently active) conversation. */
   const resolveChatAgent = async () => {
+    const agentsSvc = ctx.get("agents");
+    if (chatTargetAgent && agentsSvc?.get?.(chatTargetAgent.id)) return chatTargetAgent;
     const live = pickLiveChatAgent();
     if (live) return live;
     return resumeRecentAgent();
   };
-  /** Load the transcript of one session (live agent's session or persisted). */
-  const loadHistory = async (sessionId) => {
-    // Live agent first (its session has deriveMessages).
+  /** Load one session's transcript + title in ONE pass. Priority — the same
+   *  as the web UI's history read:
+   *  1. the LIVE SessionStore session's in-memory event log (the web reads
+   *     `ctx.sessions.get(id)` FIRST — zero disk IO, instant; a session can
+   *     live in the store without a registered Agent, so the agent registry
+   *     alone would miss this fast path);
+   *  2. the live Agent's session (when the store lookup missed);
+   *  3. one persistence.inspect (rows and title share the same read, so a
+   *     big log is decompressed once, not twice) — like the web, this read
+   *     is allowed to take however long it needs (the coordinator caches the
+   *     prepared session, so repeat reads are fast);
+   *  4. the live agent's derived messages as a last-resort fallback.
+   *
+   *  Only the RECENT tail of the transcript is returned: long conversations
+   *  are capped (older ones even harder), so loading a far-away conversation
+   *  never decompresses + serializes + renders its whole history.
+   *  @returns Promise<{ rows, title, truncated, failed }> — truncated =
+   *  { skipped, shown } when rows were cut; failed = the persisted read
+   *  threw, so the panel can offer a retry instead of an empty view. */
+  const loadTranscript = async (sessionId) => {
     const agentsSvc = ctx.get("agents");
+    const store = ctx.get("sessions");
+    // the store FIRST — exactly the web's historySourceFor() ordering
+    const storeSession = store?.get?.(sessionId);
     const liveAgent = agentsSvc?.get?.(sessionId);
-    if (liveAgent?.session && typeof liveAgent.session.deriveMessages === "function") {
-      return liveAgent.session.deriveMessages().map((msg) => ({
-        role: msg?.role === "user" ? "user" : "assistant",
-        text: messageText(msg?.content),
-      })).filter((row) => row.text);
+    const liveEvents = storeSession?.events ?? liveAgent?.session?.events;
+    let rows = null;
+    let title;
+    let usedEvents = null;
+    let failed = false;
+    if (Array.isArray(liveEvents) && liveEvents.length) {
+      rows = transcriptOf(liveEvents);
+      title = titleOf(liveEvents);
+      usedEvents = liveEvents;
+    } else {
+      try {
+        const persistence = ctx.get("sessionPersistence");
+        if (persistence && typeof persistence.inspect === "function") {
+          // NO artificial timeout: the web waits for this read too, and the
+          // coordinator caches the prepared session afterwards. A premature
+          // abort would kill a read that would otherwise succeed.
+          const inspection = await persistence.inspect(sessionId);
+          usedEvents = inspection?.events;
+          rows = transcriptOf(usedEvents);
+          title = titleOf(usedEvents);
+        }
+      } catch (err) {
+        failed = true;
+        console.error("[dsh-desktop-pet] loadTranscript(persistence) failed:", err?.message ?? err);
+      }
+      if (rows === null && liveAgent?.session && typeof liveAgent.session.deriveMessages === "function") {
+        rows = liveAgent.session.deriveMessages().map((msg) => ({
+          role: msg?.role === "user" ? "user" : "assistant",
+          text: messageText(msg?.content),
+          id: msg?.id,
+        })).filter((row) => row.text);
+      }
     }
-    try {
-      const persistence = ctx.get("sessionPersistence");
-      if (!persistence || typeof persistence.inspect !== "function") return [];
-      const inspection = await persistence.inspect(sessionId);
-      return transcriptOf(inspection?.events);
-    } catch (err) {
-      console.error("[dsh-desktop-pet] loadHistory failed:", err?.message ?? err);
-      return [];
+    if (!Array.isArray(rows)) rows = [];
+    // age-aware cap: conversations idle for a long time show even less
+    const lastTs = lastEventTs(usedEvents);
+    const isOld = typeof lastTs === "number" && Date.now() - lastTs > OLD_CONVERSATION_MS;
+    const cap = isOld ? MAX_OLD_HISTORY_ROWS : MAX_HISTORY_ROWS;
+    let truncated = null;
+    if (rows.length > cap) {
+      const skipped = rows.length - cap;
+      rows = rows.slice(rows.length - cap);
+      truncated = { skipped, shown: rows.length };
     }
+    return { rows, title, truncated, failed };
   };
   /** Submit one prompt from the pet window to the chosen agent. */
   const submitChatPrompt = async (text) => {
@@ -335,6 +576,7 @@ export function apply(ctx) {
       return false;
     }
     chatTargetAgent = agent;
+    chatFollowSessionId = agent.id; // the panel is (and stays) on this session
     chatStreaming = false;
     chatStreamText = "";
     try {
@@ -352,37 +594,128 @@ export function apply(ctx) {
     if (cmd.cmd === "prompt" && typeof cmd.text === "string" && cmd.text.trim()) {
       await submitChatPrompt(cmd.text.trim());
     } else if (cmd.cmd === "list-sessions") {
-      const rows = await listSessions();
-      sendSignal({ type: "chat", kind: "sessions", list: rows });
+      // NON-BLOCKING: populating the picker must never stall the chat bridge —
+      // the queue would otherwise delay the transcript the user just asked for
+      // behind a slow storage scan. The TTL cache keeps repeat opens instant.
+      const now = Date.now();
+      if (now - sessionsCache.at <= SESSIONS_CACHE_TTL_MS && sessionsCache.rows) {
+        sendSignal({ type: "chat", kind: "sessions", list: sessionsCache.rows });
+      } else {
+        listSessions().then((rows) => {
+          sessionsCache = { at: Date.now(), rows };
+          sendSignal({ type: "chat", kind: "sessions", list: rows });
+        });
+      }
     } else if (cmd.cmd === "select-session" && typeof cmd.sessionId === "string") {
-      // Resume the exact session (if not live) and make it the chat target.
+      // Point the chat at exactly this session. The transcript comes from the
+      // persisted log (or the live session) and does NOT need the agent, so a
+      // not-live session is resumed in the BACKGROUND — the user sees the
+      // history immediately instead of waiting for the agent to boot.
       const live = ctx.get("agents")?.get?.(cmd.sessionId);
-      const agent = live ?? await resumeSessionAgent(cmd.sessionId);
-      if (agent && typeof agent.followup === "function") {
-        chatTargetAgent = agent;
+      if (live && typeof live.followup === "function") {
+        chatTargetAgent = live;
         chatStreaming = false;
         chatStreamText = "";
+      } else {
+        resumeSessionAgent(cmd.sessionId).then((agent) => {
+          if (agent && typeof agent.followup === "function") {
+            chatTargetAgent = agent;
+            chatStreaming = false;
+            chatStreamText = "";
+          }
+        });
       }
-      const history = await loadHistory(cmd.sessionId);
-      sendSignal({ type: "chat", kind: "history", sessionId: cmd.sessionId, rows: history });
+      chatFollowSessionId = cmd.sessionId; // panel shows exactly this session
+      const t0 = Date.now();
+      const { rows: history, title, truncated, failed } = await loadTranscript(cmd.sessionId);
+      console.log(`[dsh-desktop-pet] select-session ${cmd.sessionId}: ${rows.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}${truncated ? ` (truncated -${truncated.skipped})` : ""}`);
+      sendSignal({ type: "chat", kind: "history", sessionId: cmd.sessionId, rows: history, title, truncated, failed });
+    } else if (cmd.cmd === "current-session") {
+      // The panel opened (or reopened): mirror whatever conversation is live —
+      // the pinned chat target, else the web's most recently active session.
+      const agentsSvc = ctx.get("agents");
+      let targetId = null;
+      let follow = false;
+      if (chatTargetAgent !== null && agentsSvc?.get?.(chatTargetAgent.id)) {
+        targetId = chatTargetAgent.id; // pinned target — normal transcript view
+      } else {
+        const live = agentsSvc?.list?.() ?? [];
+        targetId = activeSessionId ?? live[0]?.id ?? null;
+        follow = targetId !== null; // web-driven — the panel follows it
+      }
+      chatFollowSessionId = targetId;
+      if (!targetId) {
+        sendSignal({ type: "chat", kind: "history", sessionId: null, rows: [] });
+        return;
+      }
+      const t0 = Date.now();
+      const { rows: history, title, truncated, failed } = await loadTranscript(targetId);
+      console.log(`[dsh-desktop-pet] current-session ${targetId}: ${rows.length} rows in ${Date.now() - t0}ms${failed ? " FAILED" : ""}`);
+      sendSignal({ type: "chat", kind: "history", sessionId: targetId, rows: history, title, follow, truncated, failed });
+    } else if (cmd.cmd === "reset-chat-target") {
+      // The panel closed: drop the pinned target so the next open follows the
+      // web's active conversation again.
+      chatTargetAgent = null;
+      chatFollowSessionId = null;
+      chatStreaming = false;
+      chatStreamText = "";
+    } else if (cmd.cmd === "new-session") {
+      await startNewChat();
     }
   };
-  /** Is this event from the agent the pet chat is talking to? */
-  const isChatSession = (sessionId) => (
-    chatTargetAgent !== null && sessionId != null && sessionId === chatTargetAgent.id
-  );
+  /** Create a brand-new agent session and point the pet chat at it — the
+   *  desktop equivalent of the web UI's "new chat". The fresh agent becomes
+   *  the pinned chat target, so the next message sent from the pet continues
+   *  the new conversation (and it is a real, persistable DSH session). */
+  const startNewChat = async () => {
+    try {
+      const agentsSvc = ctx.get("agents");
+      if (!agentsSvc || typeof agentsSvc.create !== "function") {
+        sendSignal({ type: "chat", kind: "error", text: "无法开启新对话（Agent 服务不可用）" });
+        return;
+      }
+      const handle = await agentsSvc.create({
+        sessionId: `pet-chat-${crypto.randomUUID()}`,
+      });
+      if (!handle?.agent || typeof handle.agent.followup !== "function") {
+        sendSignal({ type: "chat", kind: "error", text: "无法开启新对话" });
+        return;
+      }
+      chatTargetAgent = handle.agent;
+      chatFollowSessionId = handle.agent.id;
+      chatStreaming = false;
+      chatStreamText = "";
+      sessionsCache = { at: 0, rows: [] }; // the picker must see the new session
+      sendSignal({ type: "chat", kind: "new-session", sessionId: handle.agent.id });
+    } catch (err) {
+      console.error("[dsh-desktop-pet] new-session failed:", err?.message ?? err);
+      sendSignal({ type: "chat", kind: "error", text: `开启新对话失败：${err?.message ?? err}` });
+    }
+  };
+  /** Is this session's conversation shown in the pet chat panel? The EXPLICIT
+   *  chat target (picked in the pet or resumed by a pet prompt) wins while it
+   *  is still live; otherwise the panel MIRRORS the web's currently active
+   *  session — so typing a message in the web UI shows up in the pet dialog. */
+  const isChatSession = (sessionId) => {
+    if (sessionId == null) return false;
+    const agentsSvc = ctx.get("agents");
+    if (chatTargetAgent !== null && agentsSvc?.get?.(chatTargetAgent.id)) {
+      return sessionId === chatTargetAgent.id;
+    }
+    return isCurrentSession(sessionId);
+  };
   /** Stream one assistant text delta to the pet chat window. */
-  const chatDelta = (text) => {
+  const chatDelta = (text, sid) => {
     if (!text) return;
     chatStreaming = true;
     chatStreamText += text;
-    sendSignal({ type: "chat", kind: "delta", text });
+    sendSignal({ type: "chat", kind: "delta", text, sessionId: sid });
   };
-  /** Close the current assistant stream (full accumulated text + done). */
-  const chatStreamEnd = () => {
+  /** Close an unfinished assistant stream (partial reply — e.g. interrupted). */
+  const chatStreamEnd = (sid) => {
     if (!chatStreaming) return;
     chatStreaming = false;
-    sendSignal({ type: "chat", kind: "assistant", text: chatStreamText });
+    sendSignal({ type: "chat", kind: "assistant", text: chatStreamText, sessionId: sid });
     chatStreamText = "";
   };
 
@@ -392,24 +725,44 @@ export function apply(ctx) {
   // { empty: true } after its hold window.
   let pollTimer = null;
   let polling = false;
+  let pollDisposed = false; // set when this plugin context is torn down
+  let pollAbort = null; // the in-flight poll's controller (aborted on dispose)
   const pollDelay = (attempt) => Math.min(10_000, 200 * attempt);
   const pollOnce = async (attempt) => {
-    if (polling) return;
+    if (polling || pollDisposed) return;
     polling = true;
+    // hard bound on one long-poll round trip: the pet parks a poll for
+    // POLL_HOLD_MS then answers { empty: true } — but if that response is
+    // ever lost (or a second poll stranded ours), an unbounded fetch would
+    // wedge `polling` forever and kill the whole chat bridge. Abort instead.
+    const controller = new AbortController();
+    pollAbort = controller;
+    const pollTimerForRound = setTimeout(() => controller.abort(), 25_000);
+    let hadCommand = false;
     try {
-      const res = await fetch(`http://${HOST}:${PORT}/poll`, { method: "POST" });
+      const res = await fetch(`http://${HOST}:${PORT}/poll`, { method: "POST", signal: controller.signal });
       if (res.ok) {
         const payload = await res.json().catch(() => ({}));
         if (payload && typeof payload === "object" && payload.cmd) {
+          hadCommand = true;
+          console.log("[dsh-desktop-pet] chat command:", payload?.cmd, payload?.sessionId ?? "");
           await handleChatCommand(payload);
         }
       }
-    } catch {
+    } catch (err) {
+      if (err?.name === "AbortError") {
+        console.error("[dsh-desktop-pet] poll round-trip aborted (pet unresponsive?) — re-polling");
+      }
       /* pet offline — retry after backoff */
     } finally {
+      clearTimeout(pollTimerForRound);
       polling = false;
     }
-    pollTimer = setTimeout(() => pollOnce(attempt + 1), pollDelay(attempt));
+    if (pollDisposed) return; // context torn down — never schedule again
+    // after a command, poll again quickly (backoff resets) so the next
+    // command is picked up immediately
+    const nextAttempt = hadCommand ? 1 : attempt + 1;
+    pollTimer = setTimeout(() => pollOnce(nextAttempt), pollDelay(nextAttempt));
   };
   pollOnce(1);
 
@@ -551,25 +904,101 @@ export function apply(ctx) {
     // Session log edges drive think / exec / todo / wait / celebrate.
     // Event shape (dsh-session SessionEventMap): { type, seq, time, data }.
     ctx.on("session/event", (session, event) => {
-      // Chat reply forwarding first: this session's assistant stream feeds the
-      // pet chat window (user/message echo + text-delta stream + assembled reply).
+      // Chat reply forwarding: the pet chat panel mirrors the followed
+      // session (web-side input + streamed reply). When the followed session
+      // CHANGES, the panel first receives the new session's transcript so the
+      // mirror doesn't start mid-conversation. Every signal carries the
+      // sessionId so the renderer can switch its view cleanly.
       if (isChatSession(session?.id)) {
         const type = event?.type;
+        const sid = session?.id;
         if (type === "user/message") {
           const text = textOfBlocks(event?.data?.content);
-          if (text) sendSignal({ type: "chat", kind: "user", text });
+          if (text) {
+            if (chatFollowSessionId !== sid) {
+              // a different conversation became active (e.g. the user typed in
+              // another web session): load its transcript FIRST (awaited so it
+              // arrives before the echo), then forward the new message. The
+              // live session logs the triggering message SYNCHRONOUSLY, so the
+              // transcript would already contain it — drop that exact row by
+              // message id, otherwise the panel shows the message twice (once
+              // from the history, once from the echo).
+              chatFollowSessionId = sid;
+              const msgId = event?.data?.id;
+              loadTranscript(sid).then(async ({ rows, title, truncated, failed }) => {
+                const rowsWithout = msgId
+                  ? rows.filter((r) => !(r.role === "user" && r.id === msgId))
+                  : rows;
+                await sendSignal({ type: "chat", kind: "history", sessionId: sid, rows: rowsWithout, title, follow: true, truncated, failed });
+                await sendSignal({ type: "chat", kind: "user", text, sessionId: sid });
+              });
+            } else {
+              sendSignal({ type: "chat", kind: "user", text, sessionId: sid });
+            }
+          }
         } else if (type === "assistant/chunk") {
           const chunk = event?.data?.chunk;
           if (chunk?.type === "text-delta" && typeof chunk.text === "string") {
-            chatDelta(chunk.text);
+            chatDelta(chunk.text, sid);
           }
         } else if (type === "assistant/message") {
-          chatStreamEnd();
+          // ONE authoritative assistant signal per message: the delta stream
+          // already finalized its bubble, so only send the assembled text (the
+          // renderer replaces the streaming bubble with it — no duplicate row).
+          chatStreaming = false;
+          chatStreamText = "";
           const text = textOfBlocks(event?.data?.message?.content);
-          if (text) sendSignal({ type: "chat", kind: "assistant", text });
+          if (text) sendSignal({ type: "chat", kind: "assistant", text, sessionId: sid });
+          // accumulate this step's usage into the turn stats readout
+          const usage = event?.data?.usage;
+          if (usage) {
+            chatStats.inputTokens += usage.inputTokens ?? 0;
+            chatStats.outputTokens += usage.outputTokens ?? 0;
+            chatStats.cacheReadTokens += usage.cacheReadTokens ?? 0;
+            chatStats.cacheWriteTokens += usage.cacheWriteTokens ?? 0;
+            sendSignal({ type: "chat", kind: "stats", ...chatStats, sessionId: sid });
+          }
+        } else if (type === "turn/start") {
+          // a new turn begins — reset the token stats and report the turn no.
+          resetChatStats(event?.data?.turn);
+          sendSignal({ type: "chat", kind: "stats", ...chatStats, sessionId: sid });
+        } else if (type === "tool/call") {
+          // frosted tool card like the web UI: icon + name + target summary,
+          // an io-style 参数 (arguments) section, swept with a running
+          // highlight until the matching tool/result
+          const name = event?.data?.name;
+          const callId = event?.data?.callId;
+          let summary = null;
+          let argsText = null;
+          try {
+            const args = JSON.parse(event?.data?.arguments ?? "{}");
+            summary = toolDetailOf(name, args);
+            const json = JSON.stringify(args);
+            if (json && json !== "{}") argsText = json.length > 4000 ? `${json.slice(0, 4000)}…` : json;
+          } catch {
+            /* arguments not (yet) parseable — keep header-only card */
+          }
+          sendSignal({ type: "chat", kind: "tool", callId, tool: name, label: toolLabel(name), summary, argsText, sessionId: sid });
+        } else if (type === "tool/result") {
+          const callId = event?.data?.message?.source?.callId ?? event?.data?.callId;
+          // the tool-result block wraps the raw result strings in
+          // { type: "tool-result", content: [...] } — walk INTO it
+          const block = event?.data?.message?.content?.[0];
+          const isError = !!(block && block.isError);
+          let output = null;
+          const strings = [];
+          const collect = (v) => {
+            if (typeof v === "string") strings.push(v);
+            else if (Array.isArray(v)) v.forEach(collect);
+            else if (v && typeof v === "object" && "content" in v) collect(v.content);
+          };
+          collect(event?.data?.message?.content);
+          const joined = strings.join("\n").trim();
+          if (joined) output = joined.length > 4000 ? `${joined.slice(0, 4000)}…` : joined;
+          sendSignal({ type: "chat", kind: "tool-done", callId, output, isError, sessionId: sid });
         } else if (type === "turn/end") {
-          chatStreamEnd();
-          sendSignal({ type: "chat", kind: "done" });
+          chatStreamEnd(sid); // sends a partial reply only if the stream is open
+          sendSignal({ type: "chat", kind: "done", sessionId: sid });
         }
       }
 
@@ -635,6 +1064,11 @@ export function apply(ctx) {
     clearTimeout(petRespawnTimer);
     clearTimeout(petRespawnResetTimer);
     clearTimeout(pollTimer);
+    // stop the long-poll loop completely: abort any in-flight /poll so a
+    // reloaded plugin never keeps polling (and never strands the pet's poll
+    // slot against the fresh instance)
+    pollDisposed = true;
+    try { pollAbort?.abort(); } catch { /* best-effort */ }
     // note: the spawned pet is NOT killed here — the user may want it to keep
     // running when the plugin unloads (e.g. dsh web restarts)
     for (const dispose of disposers) {

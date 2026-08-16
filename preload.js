@@ -55,6 +55,31 @@ contextBridge.exposeInMainWorld("petAPI", {
   listSessions: () => ipcRenderer.send("pet:chat-list-sessions"),
   /** Switch the chat to one historical session (loads its transcript). */
   selectSession: (sessionId) => ipcRenderer.send("pet:chat-select-session", sessionId),
+  /** Ask the plugin to mirror the web's current conversation into the panel. */
+  currentSession: () => ipcRenderer.send("pet:chat-current-session"),
+  /** Drop the pinned chat target (sent when the chat panel closes). */
+  resetChatTarget: () => ipcRenderer.send("pet:chat-reset-target"),
+  /** Start a brand-new conversation (creates a fresh agent session). */
+  newSession: () => ipcRenderer.send("pet:chat-new-session"),
+  /** Begin resizing the chat panel (captures the anchor window bounds). */
+  chatResizeStart: () => ipcRenderer.send("pet:chat-resize-start"),
+  /** Grow the chat panel by (dx, dy) — positive dx widens, positive dy
+   *  tallens; the main process anchors the pet in place. */
+  chatResizeMove: (dx, dy) => ipcRenderer.send("pet:chat-resize-move", dx, dy),
+  /** Finish resizing and persist the new panel size. */
+  chatResizeEnd: () => ipcRenderer.send("pet:chat-resize-end"),
+  /** Toggle maximize: fill the work area beside the pet / restore the
+   *  previous size. */
+  chatMaximize: () => ipcRenderer.send("pet:chat-maximize"),
+  /** Follow the maximize state so the ⛶ button can show 最大化/还原. */
+  onChatMaximized: (cb) => {
+    ipcRenderer.on("pet:chat-maximized", (_event, payload) => cb(payload));
+  },
+  /** Follow the pet's sprite offset while the panel height resizes near the
+   *  screen bottom (keeps the pet at its exact screen spot). */
+  onChatShift: (cb) => {
+    ipcRenderer.on("pet:chat-shift", (_event, shiftY) => cb(shiftY));
+  },
   /** Subscribe to chat-panel open/close events (in-pet-window panel). */
   onChatPanel: (cb) => {
     ipcRenderer.on("pet:chat-panel", (_event, payload) => cb(payload));

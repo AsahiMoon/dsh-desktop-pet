@@ -101,6 +101,8 @@ const DEFAULT_CONFIG = Object.freeze({
   taskBarPersistent: false, // keep the task-progress caption always visible
   taskBarDetailed: false, // persistent caption shows detailed progress + completed tasks
   hideWhenIdle: false, // hide the pet window entirely during its long-quiet sleep
+  chatWidth: 300, // chat panel width px (user-resizable, remembered)
+  chatHeight: 560, // chat panel height px (user-resizable, remembered)
 });
 
 // Height of the caption strip below the pet (bubble / statusbar / task
@@ -295,7 +297,7 @@ function correctForDisplay() {
     const display = screen.getDisplayMatching(win.getBounds());
     const scale = display.scaleFactor;
     if (lastScaleFactor !== null && scale !== lastScaleFactor) {
-      const { w, h } = authoritativeSize();
+      const { w, h } = currentWindowSize();
       win.setBounds({ x: win.getBounds().x, y: win.getBounds().y, width: w, height: h });
       win.setSize(w, h); // re-apply so Windows re-scales the transparent window
     }
@@ -345,12 +347,14 @@ function applyWindowConfig(cfg) {
     // Anchor the pet's TOP-LEFT corner: the sprite sits at the window's
     // top-left, so a size change only alters width/height (the pet grows
     // right/down in place) — re-centering the window would slide the pet
-    // diagonally by (new-old)/2 and feel like it "jumped".
+    // diagonally by (new-old)/2 and feel like it "jumped". When the chat
+    // panel is open, keep the enlarged chat layout instead of collapsing it.
+    const cur = currentWindowSize();
     win.setBounds({
       x: Math.round(x),
       y: Math.round(y),
-      width: size + WINDOW_EXTRA,
-      height: size + WINDOW_STRIP,
+      width: cur.w,
+      height: cur.h,
     });
   }
   const opacity = Math.max(0.2, Math.min(1, cfg.opacity ?? DEFAULT_CONFIG.opacity));
@@ -540,11 +544,12 @@ function syncBuiltinCharacters() {
 // ---------------------------------------------------------------------------
 const POLL_HOLD_MS = 20_000; // longest the plugin waits before re-polling
 const chatCommandQueue = [];
-let pendingPoll = null; // { res } parked while the queue is empty
+let pendingPoll = null; // { res, timer } parked while the queue is empty
 
 /** Queue one chat command for the plugin to collect via /poll. */
 function enqueueChatCommand(cmd) {
   chatCommandQueue.push(cmd);
+  console.log(`[pet] chat cmd queued: ${cmd?.cmd}${cmd?.sessionId ? " " + cmd.sessionId : ""}`);
   if (pendingPoll) {
     const { res } = pendingPoll;
     pendingPoll = null;
@@ -552,13 +557,30 @@ function enqueueChatCommand(cmd) {
   }
 }
 
-/** Answer one /poll request with the next queued command (or park it). */
+/** Answer one /poll request with the next queued command (or park it).
+ *  Robustness: only ONE long-poll may be parked. A second poll while one is
+ *  parked must release the OLD one (empty reply) instead of overwriting it —
+ *  an orphaned poll would never receive a response, and the plugin's fetch
+ *  would hang forever, killing the whole chat bridge. */
 function deliverPoll(res) {
   const cmd = chatCommandQueue.shift();
   if (cmd !== undefined) {
+    console.log(`[pet] poll delivered: ${cmd?.cmd}${cmd?.sessionId ? " " + cmd.sessionId : ""}`);
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify(cmd));
     return;
+  }
+  if (pendingPoll) {
+    // release the previous parked poll so no client is ever stranded
+    const old = pendingPoll;
+    pendingPoll = null;
+    clearTimeout(old.timer);
+    try {
+      old.res.writeHead(200, { "content-type": "application/json" });
+      old.res.end(JSON.stringify({ empty: true }));
+    } catch {
+      /* already closed */
+    }
   }
   pendingPoll = { res };
   const timer = setTimeout(() => {
@@ -568,6 +590,7 @@ function deliverPoll(res) {
       res.end(JSON.stringify({ empty: true }));
     }
   }, POLL_HOLD_MS);
+  pendingPoll.timer = timer;
   res.on("close", () => {
     clearTimeout(timer);
     if (pendingPoll?.res === res) pendingPoll = null;
@@ -615,6 +638,10 @@ function startSignalServer() {
           return;
         }
         if (signal && typeof signal.type === "string") {
+          if (signal.type === "chat") {
+            const s = signal;
+            console.log(`[pet] signal chat kind=${s?.kind} session=${s?.sessionId ?? ""} rows=${Array.isArray(s?.rows) ? s.rows.length : ""}${s?.failed ? " FAILED" : ""}${s?.follow ? " follow" : ""}`);
+          }
           broadcast(signal);
           if (win && !win.isDestroyed()) win.setTitle(`dsh-desktop-pet · ${signal.type}`);
           // tray tooltip mirrors meaningful agent states (character base + state)
@@ -885,29 +912,180 @@ function toggleWindow() {
 
 // ---------------------------------------------------------------------------
 // chat panel: IN the pet window, beside the model. Opening chat enlarges the
-// pet window to CHAT_W x CHAT_H (the sprite stays at its top-left corner; the
-// renderer lays the chat panel out in the grown area). Closing restores the
-// pet's normal size at its current position. Prompts/replies flow over the
+// pet window to (petSize + CHAT_PANEL_W + gap) x CHAT_H, clamped and shifted
+// so it stays fully on the hosting display (the sprite stays at its top-left
+// corner; the renderer lays the chat panel out in the grown area). Closing
+// restores the pet's normal size — at its pre-panel spot unless the user
+// dragged the enlarged window. Prompts/replies flow over the
 // single 43991 channel (/poll commands + /signal chat signals).
 // ---------------------------------------------------------------------------
-const CHAT_W = 420;
+const CHAT_PANEL_W = 300; // chat panel width (matches #chat's CSS width target)
+const CHAT_GAP = 12;      // gap between the pet sprite and the panel
 const CHAT_H = 560;
 let chatPanelOpen = false;
+// Position captured right before the panel enlarges the window; closing
+// returns the pet there (unless the user dragged the enlarged window).
+let chatRestoreBounds = null;
+// The bounds actually applied when the panel opened (the left-side flip moves
+// the window, which must NOT count as a user drag when closing).
+let chatOpenBounds = null;
+// Bottom mode (贴桌面) would keep the enlarged window behind every other
+// window, so the panel is temporarily lifted while the chat is open and the
+// pet is pushed back to the bottom when it closes.
+let chatLiftBottom = false;
+
+/** The window size to enforce RIGHT NOW: the chat layout while the panel is
+ *  open, the normal pet layout otherwise. Every setBounds that pins the
+ *  width/height must go through this, or dragging the pet / a live config
+ *  size change while chatting would collapse the enlarged window and clip
+ *  the chat panel (the "对话框显示不全" bug). Uses the user-resizable panel
+ *  size (config.chatWidth/chatHeight) so a resized panel survives reopening. */
+function currentWindowSize() {
+  const size = Math.max(64, Math.min(256, Math.round(appliedWindow.size ?? config.size ?? DEFAULT_CONFIG.size)));
+  if (chatPanelOpen) {
+    const panelW = Math.max(240, Math.min(800, Math.round(config.chatWidth ?? CHAT_PANEL_W)));
+    const h = Math.max(280, Math.min(2000, Math.round(config.chatHeight ?? CHAT_H)));
+    // pet sprite (size) + panel + gap — the panel never overlaps the sprite
+    return { w: Math.round(size + panelW + CHAT_GAP), h };
+  }
+  return { w: size + WINDOW_EXTRA, h: size + WINDOW_STRIP };
+}
+
+// Which side the chat panel is laid out on (right by default; flipped to the
+// left when the pet sits near the right screen edge). Needed to anchor the
+// window correctly while the user resizes the panel.
+let chatSide = "right";
+// Bounds captured when a resize drag starts; deltas are applied to it.
+let chatResizeAnchor = null;
+// The pet's sprite offset inside the window (--pet-shift-y) — the pet's screen
+// position is always windowY + chatShiftY, and every size change re-derives it.
+let chatShiftY = 0;
+// One-click maximize state: the panel fills the work area beside the pet;
+// toggling again restores the size remembered before maximizing.
+let chatMaximized = false;
+let chatPrevPanel = null;
+
+/** Apply a chat panel size while keeping the pet at its exact screen spot:
+ *  the window grows around the pet (right layout anchors the pet to the left
+ *  edge, left layout to the right edge; vertical overflow is absorbed by the
+ *  pet's sprite offset). Also clamps to the display work area and remembers
+ *  the resulting panel size in config. */
+function applyChatBounds(panelW, h) {
+  if (!win || win.isDestroyed()) return;
+  const size = Math.max(64, Math.min(256, Math.round(config.size ?? DEFAULT_CONFIG.size)));
+  const wa = screen.getDisplayMatching(win.getBounds()).workArea;
+  const b = win.getBounds();
+  const petScreenX = chatSide === "left" ? b.x + b.width : b.x;
+  const petScreenY = b.y + (chatShiftY ?? 0);
+  const w = Math.min(Math.round(size + Math.max(240, Math.round(panelW)) + CHAT_GAP), wa.width);
+  let hh = Math.min(Math.max(Math.round(h), Math.min(280, wa.height)), wa.height);
+  // vertical: keep the current window top unless the pet would clip — when it
+  // would, shift the window (and the pet's sprite offset) so the pet stays put
+  let y = Math.max(wa.y, Math.min(b.y, wa.y + wa.height - hh));
+  if (petScreenY + size > y + hh) {
+    y = Math.max(wa.y, Math.min(petScreenY + size - hh, wa.y + wa.height - hh));
+  }
+  const shiftY = Math.max(0, petScreenY - y);
+  let x;
+  if (chatSide === "left") {
+    x = Math.min(Math.max(petScreenX - w, wa.x), wa.x + wa.width - w);
+  } else {
+    x = Math.min(Math.max(petScreenX, wa.x), wa.x + wa.width - w);
+  }
+  win.setBounds({ x, y, width: w, height: hh });
+  chatShiftY = shiftY;
+  win.webContents.send("pet:chat-shift", shiftY);
+  config = { ...config, chatWidth: Math.round(w - size - CHAT_GAP), chatHeight: hh };
+}
+
 function openChatPanel() {
   if (!win || win.isDestroyed()) return;
   if (chatPanelOpen) return;
   chatPanelOpen = true;
   const [x, y] = win.getPosition();
-  win.setBounds({ x, y, width: CHAT_W, height: CHAT_H });
-  win.webContents.send("pet:chat-panel", { open: true });
+  chatRestoreBounds = { x, y };
+  const size = Math.max(64, Math.min(256, Math.round(appliedWindow.size ?? config.size ?? DEFAULT_CONFIG.size)));
+
+  // housekeeping: a mid-walk window must not keep wandering under the panel,
+  // and a hideWhenIdle-hidden window has to become visible for the chat
+  if (win.walkTimer) {
+    clearInterval(win.walkTimer);
+    win.walkTimer = null;
+  }
+  if (!win.isVisible()) {
+    win.show();
+    forceNoTaskbar(win);
+  }
+  // bottom mode pins the window BELOW every other window — the chat panel
+  // would be invisible there, so lift it for the duration of the chat
+  if (config.bottomMode) {
+    chatLiftBottom = true;
+    win.setFocusable(true);
+    win.setAlwaysOnTop(true);
+    win.moveTop();
+  }
+
+  const target = currentWindowSize();
+  const wa = screen.getDisplayMatching(win.getBounds()).workArea;
+  const w = Math.min(target.w, wa.width);
+  const h = Math.min(target.h, wa.height);
+  const panelSpan = w - size - CHAT_GAP; // space the panel occupies
+
+  // The PET stays exactly where it is — the panel grows beside it, toward the
+  // free space. Right side first; when the right edge is full, flip to the
+  // left (the renderer lays the panel out on the left and anchors the pet to
+  // the window's right edge). Vertically the panel may grow UPWARD past the
+  // pet when there is no room below; shiftY tells the renderer to offset the
+  // sprite so its on-screen position never changes.
+  let side = "right";
+  if (x + size + CHAT_GAP + panelSpan > wa.x + wa.width && x - panelSpan - CHAT_GAP >= wa.x) side = "left";
+  let tx, ty;
+  if (side === "left") {
+    // pet (right-anchored) stays at screen x: window left = x - panel - gap
+    tx = x - panelSpan - CHAT_GAP;
+  } else {
+    // keep the pet corner when it fits; only shift on very narrow screens
+    tx = Math.min(Math.max(x, wa.x), wa.x + wa.width - w);
+  }
+  ty = Math.min(Math.max(y, wa.y), wa.y + wa.height - h); // grow down first, up only as needed
+  const shiftY = y - ty; // pet's CSS top offset so its screen y never moves
+
+  win.setBounds({ x: tx, y: ty, width: w, height: h });
+  chatOpenBounds = { x: tx, y: ty };
+  chatSide = side;
+  chatShiftY = shiftY;
+  chatMaximized = false;
+  chatPrevPanel = null;
+  win.webContents.send("pet:chat-panel", { open: true, side, shiftY });
+  win.focus();
 }
 function closeChatPanel() {
   if (!win || win.isDestroyed()) return;
   if (!chatPanelOpen) return;
   chatPanelOpen = false;
   const size = Math.max(64, Math.min(256, Math.round(config.size ?? DEFAULT_CONFIG.size)));
+  const w = size + WINDOW_EXTRA;
+  const h = size + WINDOW_STRIP;
   const [x, y] = win.getPosition();
-  win.setBounds({ x, y, width: size + WINDOW_EXTRA, height: size + WINDOW_STRIP });
+  // If the user dragged the enlarged window while chatting, keep their spot;
+  // otherwise return the pet to exactly where it was before the panel opened.
+  // Compare against the OPENED bounds (with a small tolerance — the left-side
+  // flip legitimately moves the window and must not be mistaken for a drag).
+  const dragged = chatOpenBounds !== null
+    && (Math.abs(x - chatOpenBounds.x) > 2 || Math.abs(y - chatOpenBounds.y) > 2);
+  const pos = dragged
+    ? clampToDisplays(x, y, w, h)
+    : clampToDisplays(chatRestoreBounds?.x ?? x, chatRestoreBounds?.y ?? y, w, h);
+  chatRestoreBounds = null;
+  chatOpenBounds = null;
+  chatShiftY = 0;
+  chatMaximized = false;
+  chatPrevPanel = null;
+  win.setBounds({ x: pos.x, y: pos.y, width: w, height: h });
+  if (chatLiftBottom) {
+    chatLiftBottom = false;
+    applyBottomMode(true); // push the pet back below other windows
+  }
   win.webContents.send("pet:chat-panel", { open: false });
 }
 /** Queue one user prompt for the plugin's /poll long-poll (best-effort). */
@@ -940,7 +1118,7 @@ function openSettingsWindow() {
     alwaysOnTop: true,
     skipTaskbar: true,
     icon: WINDOW_ICON(),
-    backgroundColor: "#141426",
+    backgroundColor: "#f9fafb", // light web theme base
     webPreferences: {
       preload: path.join(ROOT, "preload.js"),
       contextIsolation: true,
@@ -1042,8 +1220,9 @@ function setupIpc() {
     // renderer's mouse deltas. Never use renderer absolute coords: screenX/Y
     // and window.screenX drift on DPI-scaled multi-display setups, but the
     // delta between two screenX readings is exact. Pin the size too (never
-    // re-read win.getSize(): it drifts on transparent windows).
-    const { w, h } = authoritativeSize();
+    // re-read win.getSize(): it drifts on transparent windows) — and use the
+    // chat layout while the panel is open so dragging doesn't clip the panel.
+    const { w, h } = currentWindowSize();
     const target = clampToDisplays(dragAnchor.x + dx, dragAnchor.y + dy, w, h, true);
     win.setBounds({
       x: target.x,
@@ -1058,7 +1237,7 @@ function setupIpc() {
   // plays the animation). Bounds are anchored at walk start, clamped to the
   // current display's work area, and cancelled by pet:drag-start.
   ipcMain.on("pet:walk-start", (_e, opts) => {
-    if (!win || win.isDestroyed() || win.walkTimer) return;
+    if (!win || win.isDestroyed() || win.walkTimer || chatPanelOpen) return;
     const b = win.getBounds();
     // the pet is at the window's left edge; clamp by the PET width so it
     // walks right up to the work area instead of stopping 150px short
@@ -1199,6 +1378,65 @@ function setupIpc() {
     if (typeof sessionId === "string" && sessionId) {
       enqueueChatCommand({ cmd: "select-session", sessionId });
     }
+  });
+  // The panel opened: mirror the web's current conversation into the panel.
+  ipcMain.on("pet:chat-current-session", () => {
+    enqueueChatCommand({ cmd: "current-session" });
+  });
+  // The panel closed: drop the pinned chat target so the next open follows
+  // the web's active conversation again.
+  ipcMain.on("pet:chat-reset-target", () => {
+    enqueueChatCommand({ cmd: "reset-chat-target" });
+  });
+  // The user clicked "new conversation": the plugin creates a fresh session.
+  ipcMain.on("pet:chat-new-session", () => {
+    enqueueChatCommand({ cmd: "new-session" });
+  });
+  // Chat panel resize (drag the panel's pet-facing edge / bottom corner):
+  // capture the anchor bounds on start, then grow the window from the deltas.
+  ipcMain.on("pet:chat-resize-start", () => {
+    if (!win || win.isDestroyed() || !chatPanelOpen) return;
+    if (win.walkTimer) {
+      clearInterval(win.walkTimer);
+      win.walkTimer = null;
+    }
+    chatResizeAnchor = { ...win.getBounds() };
+  });
+  ipcMain.on("pet:chat-resize-move", (_e, dx, dy) => {
+    if (!win || win.isDestroyed() || !chatResizeAnchor || !chatPanelOpen) return;
+    const a = chatResizeAnchor;
+    const size = Math.max(64, Math.min(256, Math.round(config.size ?? DEFAULT_CONFIG.size)));
+    const wa = screen.getDisplayMatching(win.getBounds()).workArea;
+    const w = Math.round(Math.min(Math.max(a.width + (Number.isFinite(dx) ? dx : 0),
+      Math.min(size + 240 + CHAT_GAP, wa.width)), wa.width));
+    const h = Math.round(Math.min(Math.max(a.height + (Number.isFinite(dy) ? dy : 0),
+      Math.min(280, wa.height)), wa.height));
+    applyChatBounds(w - size - CHAT_GAP, h);
+  });
+  ipcMain.on("pet:chat-resize-end", () => {
+    chatResizeAnchor = null;
+    saveConfig(); // persist the resized panel size
+  });
+  // One-click maximize / restore: fill the work area beside the pet, or return
+  // to the size remembered before maximizing (the pet never moves either way).
+  ipcMain.on("pet:chat-maximize", () => {
+    if (!win || win.isDestroyed() || !chatPanelOpen) return;
+    const size = Math.max(64, Math.min(256, Math.round(config.size ?? DEFAULT_CONFIG.size)));
+    const wa = screen.getDisplayMatching(win.getBounds()).workArea;
+    const b = win.getBounds();
+    if (!chatMaximized) {
+      chatMaximized = true;
+      chatPrevPanel = { w: Math.round(b.width - size - CHAT_GAP), h: b.height };
+      const petScreenX = chatSide === "left" ? b.x + b.width : b.x;
+      const panelW = (chatSide === "left" ? petScreenX - wa.x : wa.x + wa.width - petScreenX) - CHAT_GAP;
+      applyChatBounds(panelW, wa.height);
+    } else {
+      chatMaximized = false;
+      if (chatPrevPanel) applyChatBounds(chatPrevPanel.w, chatPrevPanel.h);
+      chatPrevPanel = null;
+    }
+    win.webContents.send("pet:chat-maximized", { on: chatMaximized });
+    saveConfig();
   });
 
   ipcMain.on("pet:quit", () => app.quit());

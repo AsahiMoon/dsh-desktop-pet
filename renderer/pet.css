@@ -23,10 +23,13 @@ html, body {
 
 /* Pet area: an EXACT square (size x size) anchored at the window's TOP-LEFT
    (the window is wider — extra room on the right hosts a wide flat info box).
-   --pet-size is set from config by the renderer. */
+   --pet-size is set from config by the renderer. While the chat panel is open
+   the main process keeps the pet at its exact on-screen spot by growing the
+   window around it; --pet-shift-y offsets the sprite so its screen position
+   never changes even when the panel extends above it. */
 #pet {
   position: absolute;
-  top: 0;
+  top: var(--pet-shift-y, 0);
   left: 0;
   width: var(--pet-size, 110px);
   aspect-ratio: 1 / 1;
@@ -99,9 +102,12 @@ html, body {
 
 .hidden { display: none !important; }
 
-/* settings window mode (separate BrowserWindow with ?settings=1) */
+/* settings window mode (separate BrowserWindow with ?settings=1) — light web
+   theme with the shared background image */
 body[data-settings] {
-  background: #141426;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.82), rgba(249, 250, 251, 0.92)),
+    url("chat-bg.webp") 50% 0% / cover no-repeat;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -126,16 +132,18 @@ body[data-settings] #stage {
   overflow-y: auto;
   padding: 10px 14px;
   border-radius: 12px;
-  background: rgba(16, 20, 38, 0.92);
-  color: #eafffa;
+  background: rgba(255, 255, 255, 0.72);
+  border: 1px solid rgba(0, 0, 0, 0.06);
+  color: #172347;
   font: 13px/1.8 "Microsoft YaHei", sans-serif;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.45);
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.2);
   z-index: 20;
 }
 #settings .settings-title {
   font-weight: 600;
   margin-bottom: 4px;
   text-align: center;
+  color: #4176e6;
 }
 #settings label {
   display: block;
@@ -143,20 +151,20 @@ body[data-settings] #stage {
 }
 #settings input[type="range"] {
   width: 100%;
-  accent-color: #39c5bb;
+  accent-color: #4176e6;
 }
 #settings select {
   width: 100%;
   padding: 3px 6px;
-  border: none;
+  border: 1px solid rgba(0, 0, 0, 0.1);
   border-radius: 6px;
-  background: rgba(57, 197, 187, 0.18);
-  color: #eafffa;
+  background: #fff;
+  color: #172347;
   font: 13px "Microsoft YaHei", sans-serif;
 }
 #settings select option {
-  background: #141426;
-  color: #eafffa;
+  background: #fff;
+  color: #172347;
 }
 #settings button {
   margin-top: 6px;
@@ -164,11 +172,12 @@ body[data-settings] #stage {
   padding: 4px 0;
   border: none;
   border-radius: 8px;
-  background: rgba(57, 197, 187, 0.3);
-  color: #eafffa;
+  background: #4176e6;
+  color: #fff;
   cursor: pointer;
+  transition: background-color 0.15s ease;
 }
-#settings button:hover { background: rgba(57, 197, 187, 0.5); }
+#settings button:hover { background: #4f80ec; }
 #settings .check-row {
   display: flex;
   align-items: center;
@@ -178,7 +187,7 @@ body[data-settings] #stage {
 }
 #settings input[type="checkbox"] {
   width: auto;
-  accent-color: #39c5bb;
+  accent-color: #4176e6;
 }
 #settings .paths {
   margin: 6px 0;
@@ -190,14 +199,17 @@ body[data-settings] #stage {
   grid-column: 1 / -1;
   font-size: 10px;
   line-height: 1.5;
-  color: rgba(234, 255, 250, 0.6);
+  color: #61666b;
   word-break: break-all;
 }
 #settings .paths button {
   margin: 0;
   padding: 3px 0;
   font-size: 12px;
+  background: rgba(65, 118, 230, 0.1);
+  color: #4176e6;
 }
+#settings .paths button:hover { background: rgba(65, 118, 230, 0.18); }
 
 /* entry pop animation */
 #stage.enter #sprite { animation: pop-in 0.4s ease-out; }
@@ -209,7 +221,9 @@ body[data-settings] #stage {
 /* chat window mode (separate BrowserWindow with ?chat=1) — legacy fallback,
    no longer produced by main.js (the panel lives in the pet window now). */
 body[data-chat] {
-  background: #0f1630;
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.74), rgba(249, 250, 251, 0.90)),
+    url("chat-bg.webp") 50% 0% / cover no-repeat;
   display: flex;
   align-items: stretch;
   justify-content: stretch;
@@ -227,26 +241,76 @@ body[data-chat] #bubble,
 body[data-chat] #statusbar {
   display: none !important;
 }
+/* legacy full-window chat: the fluid width (which reserves the pet zone) must
+   not leave an empty strip — the panel fills the whole window here */
+body[data-chat] #chat {
+  width: 100%;
+  border-left: none;
+  box-shadow: none;
+}
 
-/* In-pet-window chat panel: the pet window grows to CHAT_W x CHAT_H when the
-   panel opens; the sprite stays at its top-left corner and the panel is laid
-   out in the RIGHT portion (and full height) of the grown window. */
+/* In-pet-window chat panel: the pet window grows to (petSize + panel + gap) x
+   CHAT_H when the panel opens; the pet stays at its exact on-screen spot and
+   the panel is laid out in the RIGHT portion of the grown window by default —
+   when the pet sits near the right edge, the main process flips the layout so
+   the panel is on the LEFT (body[data-chat-side="left"]) and the pet anchors
+   to the right edge instead. The width is FLUID: it always leaves the pet zone
+   (--pet-size) free, so a large pet never overlaps the panel. */
+/* ---------------------------------------------------------------------------
+   Chat panel — themed after the DSH web UI (浅色主题):
+   - the web's own background image (chat-bg.webp, extracted from the running
+     web app) shown cover, under a light frosted scrim like the web's
+     translucent cards on the body wallpaper
+   - DeepSeek brand blue #4176E6 accents, label navy #172347 text, the web's
+     user bubble #EDF3FE, and tool cards with the running sweep highlight
+     (调用工具时的扫光虚化) plus an io-style output preview
+   --------------------------------------------------------------------------- */
 #chat {
   position: absolute;
   top: 0;
   right: 0;
   bottom: 0;
-  width: 300px;
+  width: calc(100% - var(--pet-size, 110px) - 12px);
+  min-width: 240px;
+  max-width: 340px;
   display: flex;
   flex-direction: column;
-  color: #eafffa;
+  color: #172347;
   font: 14px/1.6 "Microsoft YaHei", sans-serif;
-  background: linear-gradient(180deg, #121b3e 0%, #0f1630 100%);
+  background:
+    linear-gradient(rgba(255, 255, 255, 0.74), rgba(249, 250, 251, 0.90)),
+    url("chat-bg.webp") 50% 0% / cover no-repeat;
   overflow: hidden;
-  border-left: 1px solid rgba(97, 122, 189, 0.25);
+  border-left: 1px solid rgba(0, 0, 0, 0.06);
+  box-shadow: -6px 0 24px rgba(0, 0, 0, 0.28);
   user-select: text;
   cursor: default;
   z-index: 30;
+}
+/* border-box everywhere: every max-width: 100% / 92% caps the FULL box, so
+   padded cards (tool cards, bubbles) can never push a horizontal scrollbar */
+#chat *,
+#chat *::before,
+#chat *::after {
+  box-sizing: border-box;
+}
+/* left-side layout: panel on the left, pet anchored to the right edge */
+body[data-chat-side="left"] #pet {
+  left: auto;
+  right: 0;
+}
+body[data-chat-side="left"] #chat {
+  left: 0;
+  right: auto;
+  border-left: none;
+  border-right: 1px solid rgba(0, 0, 0, 0.06);
+  box-shadow: 6px 0 24px rgba(0, 0, 0, 0.28);
+}
+/* while the panel is open the caption strip (bubble / status bar) belongs to
+   the pet zone only — hide it so it never pokes out under the panel */
+body[data-chat-open] #bubble,
+body[data-chat-open] #statusbar {
+  display: none !important;
 }
 #chat .chat-title {
   display: flex;
@@ -256,8 +320,27 @@ body[data-chat] #statusbar {
   padding: 8px 10px;
   font-weight: 600;
   font-size: 13px;
-  border-bottom: 1px solid rgba(97, 122, 189, 0.25);
+  color: #172347;
+  background: rgba(255, 255, 255, 0.55);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
   flex: 0 0 auto;
+  cursor: grab;
+}
+#chat .chat-title:active { cursor: grabbing; }
+/* whale-girl avatar: the active character's idle frame, cropped round —
+   shows the pet's face right in the dialog title bar */
+#chat .chat-avatar {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 1px solid rgba(65, 118, 230, 0.25);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.15);
+  background-color: #e8f1ff;
+  background-repeat: no-repeat;
+  display: none;
 }
 #chat .chat-title #chat-title-label {
   flex: 1 1 auto;
@@ -268,42 +351,71 @@ body[data-chat] #statusbar {
 #chat .chat-title button {
   border: none;
   background: transparent;
-  color: rgba(234, 255, 250, 0.7);
+  color: rgba(23, 35, 71, 0.7);
   font-size: 14px;
   cursor: pointer;
   padding: 2px 6px;
   border-radius: 6px;
+  transition: background-color 0.15s ease;
 }
-#chat .chat-title button:hover { background: rgba(57, 197, 187, 0.25); }
+#chat .chat-title button:hover { background: rgba(65, 118, 230, 0.12); }
+#chat .chat-title button.active {
+  background: rgba(65, 118, 230, 0.18);
+  color: #4176e6;
+}
 #chat .chat-title .chat-session-btn { font-size: 15px; }
 
 /* session picker list (toggle via 🗂️) */
 #chat .chat-sessions {
   flex: 0 0 auto;
-  max-height: 180px;
+  max-height: 200px;
   overflow-y: auto;
-  border-bottom: 1px solid rgba(97, 122, 189, 0.25);
+  overflow-x: hidden;
+  overscroll-behavior: contain;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
   display: flex;
   flex-direction: column;
   gap: 2px;
   padding: 6px 8px;
-  background: rgba(10, 14, 32, 0.6);
+  background: rgba(255, 255, 255, 0.5);
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  animation: chat-sessions-in 0.18s ease-out;
+}
+@keyframes chat-sessions-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+#chat .chat-sessions-head {
+  font-size: 10px;
+  letter-spacing: 0.5px;
+  color: #4176e6;
+  padding: 2px 4px 4px;
 }
 #chat .chat-session-row {
   text-align: left;
   border: none;
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.06);
-  color: #eafffa;
+  background: rgba(255, 255, 255, 0.62);
+  color: #172347;
   font: 12px/1.5 "Microsoft YaHei", sans-serif;
   padding: 6px 8px;
   cursor: pointer;
   display: flex;
   flex-direction: column;
   gap: 2px;
+  position: relative;
+  border-left: 3px solid transparent;
+  transition: background-color 0.15s ease, border-color 0.15s ease;
 }
-#chat .chat-session-row:hover { background: rgba(57, 197, 187, 0.2); }
-#chat .chat-session-row.active { background: rgba(57, 197, 187, 0.35); }
+#chat .chat-session-row:hover {
+  background: rgba(65, 118, 230, 0.09);
+  border-left-color: rgba(65, 118, 230, 0.8);
+}
+#chat .chat-session-row.active {
+  background: rgba(65, 118, 230, 0.14);
+  border-left-color: #4176e6;
+}
 #chat .chat-session-title {
   font-weight: 600;
   overflow: hidden;
@@ -312,21 +424,49 @@ body[data-chat] #statusbar {
 }
 #chat .chat-session-preview {
   font-size: 11px;
-  color: rgba(234, 255, 250, 0.55);
+  color: #61666b;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+#chat .chat-session-meta {
+  font-size: 10px;
+  color: #81858c;
+}
 #chat .chat-session-empty {
   font-size: 12px;
-  color: rgba(234, 255, 250, 0.5);
+  color: #61666b;
   padding: 8px;
   text-align: center;
+}
+
+/* thin, rounded, DeepSeek-blue scrollbars for the picker + transcript */
+#chat .chat-sessions::-webkit-scrollbar,
+#chat .chat-messages::-webkit-scrollbar {
+  width: 8px;
+}
+#chat .chat-sessions::-webkit-scrollbar-track,
+#chat .chat-messages::-webkit-scrollbar-track {
+  background: transparent;
+}
+#chat .chat-sessions::-webkit-scrollbar-thumb,
+#chat .chat-messages::-webkit-scrollbar-thumb {
+  background: rgba(65, 118, 230, 0.35);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+#chat .chat-sessions::-webkit-scrollbar-thumb:hover,
+#chat .chat-messages::-webkit-scrollbar-thumb:hover {
+  background: rgba(65, 118, 230, 0.65);
+  background-clip: padding-box;
 }
 
 #chat .chat-messages {
   flex: 1 1 auto;
   overflow-y: auto;
+  overflow-x: hidden; /* never a horizontal scrollbar under the transcript */
+  overscroll-behavior: contain;
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
@@ -336,6 +476,7 @@ body[data-chat] #statusbar {
 #chat .chat-row {
   display: flex;
   max-width: 92%;
+  min-width: 0; /* long content wraps instead of pushing a scrollbar */
 }
 #chat .chat-user {
   align-self: flex-end;
@@ -347,60 +488,395 @@ body[data-chat] #statusbar {
 }
 #chat .chat-bubble {
   padding: 8px 12px;
-  border-radius: 12px;
+  border-radius: 18px;
   white-space: pre-wrap;
   word-break: break-word;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25);
+  min-width: 0;
 }
+/* maid-atelier porcelain bubbles with gold rims (dsh-deep-whale skin):
+   user = right-aligned porcelain blue-white, tail at bottom-right */
 #chat .chat-user .chat-bubble {
-  background: rgba(57, 197, 187, 0.85);
-  color: #06251f;
-  border-bottom-right-radius: 4px;
+  background: rgba(232, 237, 249, 0.96);
+  border: 1px solid rgba(197, 164, 104, 0.48);
+  border-radius: 18px 18px 6px 18px;
+  color: #172347;
+  box-shadow: 0 6px 20px rgba(19, 38, 87, 0.1);
 }
+/* assistant = porcelain cream-white, tail at bottom-left */
 #chat .chat-assistant .chat-bubble {
-  background: rgba(255, 255, 255, 0.1);
-  border-bottom-left-radius: 4px;
+  background: rgba(248, 250, 255, 0.96);
+  border: 1px solid rgba(197, 164, 104, 0.42);
+  border-radius: 18px 18px 18px 6px;
+  color: #172347;
+  box-shadow: 0 4px 14px rgba(19, 38, 87, 0.08);
 }
 
+/* maid-atelier porcelain tool card: porcelain base + thin gold rim (like the
+   skin's message bubbles), compact row (icon + name + target), an 输入
+   io-section with the arguments, a running sweep while the tool executes,
+   then an 输出 io-section with the result */
+#chat .chat-tool {
+  align-self: flex-start;
+  max-width: 100%;
+  min-width: 0;
+  background: rgba(248, 250, 255, 0.94);
+  border: 1px solid rgba(197, 164, 104, 0.42);
+  border-radius: 12px;
+  padding: 5px 9px;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 4px 14px rgba(19, 38, 87, 0.08);
+  color: #172347;
+}
+#chat .chat-tool[data-running] {
+  border-color: rgba(197, 164, 104, 0.8);
+  box-shadow: 0 2px 14px rgba(19, 38, 87, 0.14);
+}
+/* the running sweep highlights the header ROW only (like the web), never
+   covering the 输入/输出 sections */
+#chat .chat-tool[data-running] .chat-tool-head::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -300px;
+  width: 300px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.95) 55%, transparent 100%);
+  animation: chat-tool-sweep 2.6s ease-out infinite;
+}
+@keyframes chat-tool-sweep {
+  0% { left: -300px; }
+  90%, 100% { left: 100%; }
+}
+/* compact header row — like the web's ~24px tool row */
+#chat .chat-tool-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  line-height: 18px;
+  position: relative;
+  overflow: hidden;
+}
+#chat .chat-tool-icon { flex: none; font-size: 12px; }
+#chat .chat-tool-name {
+  flex: none;
+  max-width: 40%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #4176e6;
+  font-weight: 500;
+}
+#chat .chat-tool-sep {
+  flex: none;
+  width: 2px;
+  height: 2px;
+  border-radius: 1px;
+  background: #81858c;
+}
+#chat .chat-tool-summary {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #61666b;
+}
+/* io section (输入 / 输出) — porcelain code surface, sticky label column +
+   scrollable mono text */
+#chat .chat-tool-io {
+  margin-top: 4px;
+  border: 1px solid rgba(197, 164, 104, 0.22);
+  border-radius: 10px;
+  background: rgba(249, 250, 253, 0.92);
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  align-items: baseline;
+  column-gap: 10px;
+  max-height: 120px;
+  overflow-y: auto;
+  overflow-x: hidden; /* mono text wraps — no horizontal bar inside the card */
+}
+#chat .chat-tool-io-label {
+  color: #81858c;
+  font-size: 10px;
+  line-height: 1.6;
+  align-self: start;
+  position: sticky;
+  top: 0;
+  padding: 4px 0 4px 8px;
+  background: rgba(249, 250, 253, 0.95);
+}
+#chat .chat-tool-io-text {
+  font: 10px/1.6 ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+  color: #4a5568;
+  white-space: pre-wrap;
+  word-break: break-word;
+  min-width: 0;
+  padding: 4px 8px 4px 0;
+}
+#chat .chat-tool-io-text[data-error] { color: #ec1313; }
+
+/* consecutive tool calls merge into one collapsible group: collapsed by
+   default, the head shows the count + the LATEST tool's preview (the long
+   runs no longer push the conversation down); click to expand the full run
+   with every card's 输入/输出 sections */
+#chat .chat-tool-group {
+  align-self: flex-start;
+  max-width: 100%;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+#chat .chat-tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  border: 1px solid rgba(197, 164, 104, 0.45);
+  border-radius: 12px;
+  background: rgba(248, 250, 255, 0.94);
+  color: #172347;
+  font: 11px/20px "Microsoft YaHei", sans-serif;
+  padding: 2px 10px;
+  cursor: pointer;
+  position: relative;
+  overflow: hidden;
+  box-shadow: 0 4px 14px rgba(19, 38, 87, 0.08);
+  transition: background-color 0.15s ease, border-color 0.15s ease;
+}
+#chat .chat-tool-group-head:hover { background: rgba(244, 246, 252, 0.98); }
+#chat .chat-tool-group-count { flex: none; color: #405a99; font-weight: 600; white-space: nowrap; }
+#chat .chat-tool-group-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: #61666b;
+}
+#chat .chat-tool-group-chevron { flex: none; font-size: 9px; color: #81858c; }
+/* running sweep on the head while ANY card inside is still executing */
+#chat .chat-tool-group.running .chat-tool-group-head::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -300px;
+  width: 300px;
+  pointer-events: none;
+  background: linear-gradient(90deg, transparent 0%, rgba(255, 255, 255, 0.95) 55%, transparent 100%);
+  animation: chat-tool-sweep 2.6s ease-out infinite;
+}
+#chat .chat-tool-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+#chat .chat-tool-group-body > .chat-tool { align-self: stretch; }
+#chat .chat-tool-group.collapsed .chat-tool-group-body { display: none; }
+/* retry button inside the history-load timeout placeholder */
+#chat .chat-retry-btn {
+  border: 1px solid rgba(65, 118, 230, 0.4);
+  border-radius: 999px;
+  background: rgba(65, 118, 230, 0.1);
+  color: #4176e6;
+  font: 12px/1.6 "Microsoft YaHei", sans-serif;
+  padding: 2px 12px;
+  cursor: pointer;
+  margin-left: 4px;
+  transition: background-color 0.15s ease;
+}
+#chat .chat-retry-btn:hover { background: rgba(65, 118, 230, 0.18); }
+/* note shown when an old/long conversation was loaded as its recent tail
+   only — tells the user earlier records were intentionally not fetched */
+#chat .chat-truncated-note {
+  align-self: center;
+  max-width: 100%;
+  font-size: 10px;
+  line-height: 1.6;
+  color: #81858c;
+  background: rgba(65, 118, 230, 0.07);
+  border: 1px solid rgba(65, 118, 230, 0.18);
+  border-radius: 999px;
+  padding: 2px 10px;
+  margin: 2px 0 6px;
+  text-align: center;
+}
+
+/* input box — the maid-atelier composer card: a porcelain card wrapped in the
+   skin's ornamental gold frame (nine-slice border-image art), generous corner
+   radius and a soft deep-blue shadow; the textarea sits borderless inside */
 #chat .chat-input-row {
   flex: 0 0 auto;
+  position: relative;
+  isolation: isolate;
   display: flex;
-  gap: 8px;
+  gap: 10px;
   align-items: flex-end;
-  padding: 10px 14px;
-  border-top: 1px solid rgba(97, 122, 189, 0.25);
+  margin: 12px 12px 18px; /* room for the frame overhang above/below */
+  padding: 26px 18px 18px;
+  border: 0;
+  border-radius: 30px;
+  background: linear-gradient(180deg, rgba(255, 254, 250, 0.95), rgba(244, 247, 253, 0.88));
+  box-shadow: 0 18px 54px rgba(15, 30, 72, 0.2), 0 2px 8px rgba(15, 30, 72, 0.12);
+}
+/* the ornamental frame: scaled nine-slice of the skin's composer frame art,
+   drawn on a layer slightly larger than the card (the frame overhangs it) */
+#chat .chat-input-row::before {
+  content: "";
+  position: absolute;
+  box-sizing: border-box;
+  inset: -10px -8px -12px;
+  z-index: 1;
+  border-style: solid;
+  border-width: 31px 22px 21px 22px;
+  border-image-source: url("maid-composer-frame.webp");
+  border-image-slice: 31 22 21 22;
+  border-image-width: 31px 22px 21px 22px;
+  border-image-repeat: stretch;
+  filter: drop-shadow(0 9px 18px rgba(5, 13, 38, 0.22));
+  pointer-events: none;
+}
+#chat .chat-input-row > * { position: relative; z-index: 2; }
+#chat .chat-input-row:focus-within {
+  box-shadow: 0 0 0 3px rgba(0, 232, 208, 0.14), 0 18px 54px rgba(15, 30, 72, 0.22);
 }
 #chat .chat-input-row textarea {
   flex: 1 1 auto;
+  min-width: 0;
   resize: none;
-  border: 1px solid rgba(97, 122, 189, 0.4);
-  border-radius: 10px;
-  background: rgba(255, 255, 255, 0.08);
-  color: #eafffa;
+  border: none;
+  border-radius: 12px;
+  background: transparent;
+  color: #172347;
+  caret-color: #405a99;
   font: 14px/1.5 "Microsoft YaHei", sans-serif;
-  padding: 8px 10px;
-  min-height: 40px;
+  padding: 4px 2px;
+  min-height: 36px;
   max-height: 120px;
   outline: none;
 }
-#chat .chat-input-row textarea:focus { border-color: #39c5bb; }
+#chat .chat-input-row textarea::placeholder { color: #81858c; }
+#chat .chat-input-row textarea:focus {
+  border: none;
+  background: transparent;
+  box-shadow: none;
+}
 #chat .chat-input-row textarea:disabled { opacity: 0.6; }
 #chat .chat-input-row button {
   flex: 0 0 auto;
-  border: none;
-  border-radius: 10px;
-  background: rgba(57, 197, 187, 0.8);
-  color: #06251f;
+  width: 38px;
+  height: 38px;
+  border: 1px solid rgba(225, 207, 170, 0.82);
+  border-radius: 50%;
+  /* the maid primary action: porcelain-blue gradient with a gold rim */
+  background: linear-gradient(145deg, #6680bd, #304a91);
+  color: #fdfaf2;
   font: 600 14px "Microsoft YaHei", sans-serif;
-  padding: 10px 18px;
+  padding: 0;
   cursor: pointer;
+  box-shadow: 0 4px 12px rgba(26, 50, 108, 0.28);
+  transition: filter 0.15s ease, transform 0.15s ease;
 }
-#chat .chat-input-row button:hover:not(:disabled) { background: rgba(57, 197, 187, 1); }
+#chat .chat-input-row button:hover:not(:disabled) { filter: brightness(1.1); transform: translateY(-1px); }
 #chat .chat-input-row button:disabled { opacity: 0.5; cursor: default; }
+/* 轮次 / token / 缓存命中 readout under the input (web TurnTail style) */
+#chat .chat-stats {
+  flex: 0 0 auto;
+  padding: 2px 14px 4px;
+  font-size: 10px;
+  line-height: 1.5;
+  color: #81858c;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-height: 15px;
+}
 #chat .chat-hint {
   flex: 0 0 auto;
   padding: 0 14px 8px;
   font-size: 11px;
-  color: rgba(234, 255, 250, 0.5);
+  color: #61666b;
   min-height: 16px;
+}
+
+/* resize handles: drag the LEFT or RIGHT edge to stretch the panel width, the
+   bottom edge for height. Always-visible subtle grips make them easy to find;
+   hover/active highlights make the grab zones obvious. */
+#chat .chat-resize {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 6;
+}
+#chat .chat-resize-edge,
+#chat .chat-resize-bottom {
+  position: absolute;
+  pointer-events: auto;
+  touch-action: none;
+}
+/* left edge (width) */
+#chat .chat-resize-left {
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 11px;
+  cursor: ew-resize;
+}
+/* right edge (width) */
+#chat .chat-resize-right {
+  right: 0;
+  top: 0;
+  bottom: 0;
+  width: 11px;
+  cursor: ew-resize;
+}
+#chat .chat-resize-edge::before {
+  content: "";
+  position: absolute;
+  top: 10%;
+  bottom: 10%;
+  left: 50%;
+  width: 2px;
+  margin-left: -1px;
+  border-radius: 2px;
+  background: rgba(65, 118, 230, 0.30);
+  transition: background-color 0.15s ease;
+}
+/* bottom edge (height) */
+#chat .chat-resize-bottom {
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 11px;
+  cursor: ns-resize;
+}
+#chat .chat-resize-bottom::before {
+  content: "";
+  position: absolute;
+  left: 8%;
+  right: 8%;
+  bottom: 50%;
+  height: 2px;
+  margin-bottom: -1px;
+  border-radius: 2px;
+  background: rgba(65, 118, 230, 0.30);
+  transition: background-color 0.15s ease;
+}
+/* hover/active: brighten the grips so the grab zones are obvious */
+#chat .chat-resize-edge:hover::before,
+#chat .chat-resize-edge:active::before,
+#chat .chat-resize-bottom:hover::before,
+#chat .chat-resize-bottom:active::before {
+  background: rgba(65, 118, 230, 0.75);
+}
+#chat .chat-resize-edge:hover,
+#chat .chat-resize-bottom:hover {
+  background: rgba(65, 118, 230, 0.08);
 }

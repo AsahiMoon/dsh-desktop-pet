@@ -23,6 +23,8 @@ export const DEFAULTS = Object.freeze({
   taskBarPersistent: false, // keep the task-progress caption always visible
   taskBarDetailed: false, // persistent caption shows detailed progress + completed tasks
   hideWhenIdle: false, // hide the pet window entirely during its long-quiet sleep
+  chatWidth: 300, // chat panel width px (user-resizable, remembered)
+  chatHeight: 560, // chat panel height px (user-resizable, remembered)
 });
 
 /** schemastery schema for settings.register (defaults mirror DEFAULTS). */
@@ -46,6 +48,8 @@ export function buildSchema() {
     taskBarPersistent: z.boolean().default(DEFAULTS.taskBarPersistent),
     taskBarDetailed: z.boolean().default(DEFAULTS.taskBarDetailed),
     hideWhenIdle: z.boolean().default(DEFAULTS.hideWhenIdle),
+    chatWidth: z.number().min(240).max(800).default(DEFAULTS.chatWidth),
+    chatHeight: z.number().min(280).max(2000).default(DEFAULTS.chatHeight),
   });
 }
 

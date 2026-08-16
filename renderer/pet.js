@@ -25,6 +25,8 @@ const DEFAULT_CONFIG = Object.freeze({
   taskBarPersistent: false,
   taskBarDetailed: false,
   hideWhenIdle: false,
+  chatWidth: 300, // chat panel size (user-resizable; main process owns sizing)
+  chatHeight: 560,
 });
 
 const TICK_ACTIVE_MS = 60_000; // +1 xp per minute of company
@@ -229,6 +231,7 @@ async function loadCharacter(id) {
       CHARACTER_ID = id;
       ASSET_BASE = base;
       STATES = ch.states;
+      updateChatAvatar(); // the chat title bar shows this character's face
       if (stage.dataset.state) setState(stage.dataset.state); // replay with new art
       return;
     }
@@ -243,11 +246,30 @@ async function loadCharacter(id) {
     CHARACTER_ID = id;
     ASSET_BASE = base; // unused for codex pets (sheets are inline data URLs)
     STATES = states;
+    updateChatAvatar();
     if (stage.dataset.state) setState(stage.dataset.state);
     return;
   } catch (err) {
     if (token === loadToken) console.error(`character ${id} codex load failed:`, err.message);
   }
+}
+
+/** Show the ACTIVE character's idle frame (first frame only) as the round
+ *  avatar in the chat title bar — the whale-girl face lives in the dialog. */
+function updateChatAvatar() {
+  const av = document.getElementById("chat-avatar");
+  if (!av) return;
+  const idle = STATES?.idle;
+  if (!idle) {
+    av.style.display = "none";
+    return;
+  }
+  const url = /^(data:|https?:|pet:)/.test(idle.sheet) ? idle.sheet : `${ASSET_BASE}${idle.sheet}`;
+  const frames = Math.max(1, idle.frames ?? 1);
+  av.style.backgroundImage = `url("${url}")`;
+  av.style.backgroundSize = `${frames * 100}% 100%`; // one frame of the strip
+  av.style.backgroundPosition = "0 0";
+  av.style.display = "inline-block";
 }
 
 // ---------------------------------------------------------------------------
@@ -640,6 +662,12 @@ if (hideWhenIdleInput) {
 // ---------------------------------------------------------------------------
 let drag = null;
 let pierceMode = false;
+// chat panel resize state (set by the resize handles in the chat panel):
+// deltas are forwarded to main, which grows the window anchored to the pet.
+let resizing = null;
+// what started the current window drag: "pet" (sprite) or "title" (chat title
+// bar) — a title-bar drag moves the window but leaves the pet's state alone.
+let dragSource = "pet";
 // a drag ends with the mouse over the stage too (the window follows the
 // cursor), which would fire a "click" — remember whether the last drag moved
 let lastDragWasMove = false;
@@ -654,6 +682,7 @@ petEl.addEventListener("mousedown", (e) => {
   // applies the mouse DELTAS. window.screenX / absolute screenX/Y are not
   // reliable across DPI-scaled multi-display setups (they drift by ~200px),
   // but the delta between two screenX values is exact.
+  dragSource = "pet";
   drag = { startScreenX: e.screenX, startScreenY: e.screenY, moved: false };
   window.petAPI.dragStart();
   showPet();
@@ -662,6 +691,20 @@ petEl.addEventListener("mousedown", (e) => {
 
 let lastMoveAt = 0;
 window.addEventListener("mousemove", (e) => {
+  if (resizing) {
+    const now = Date.now();
+    if (now - lastMoveAt < 16) return; // throttle to ~60fps
+    lastMoveAt = now;
+    const rawDx = e.screenX - resizing.startX;
+    const rawDy = e.screenY - resizing.startY;
+    // intuitive edge stretch: drag an edge OUTWARD to enlarge the panel
+    // (left edge: dragging left grows; right edge: dragging right grows).
+    // The main process anchors the pet, so the window grows on the free side.
+    const growthX = resizing.mode === "left" ? -rawDx : (resizing.mode === "right" ? rawDx : 0);
+    const growthY = resizing.mode === "bottom" ? rawDy : 0;
+    window.petAPI.chatResizeMove(growthX, growthY);
+    return;
+  }
   if (!drag) return;
   const now = Date.now();
   if (now - lastMoveAt < 16) return; // throttle to ~60fps
@@ -676,13 +719,25 @@ window.addEventListener("mousemove", (e) => {
 });
 
 window.addEventListener("mouseup", (e) => {
+  if (resizing) {
+    resizing = null;
+    if (window.petAPI && typeof window.petAPI.chatResizeEnd === "function") {
+      window.petAPI.chatResizeEnd();
+    }
+    return;
+  }
   if (!drag) return;
-  lastDragWasMove = drag.moved;
+  const moved = drag.moved;
+  const source = dragSource;
   drag = null;
-  // a real drag interrupts any busy chain (celebrate / eat / post-work nap),
-  // otherwise the dropped onEnd would leave busy stuck at true
-  if (lastDragWasMove) busy = false;
-  setState("idle");
+  dragSource = "pet";
+  if (source === "pet") {
+    lastDragWasMove = moved;
+    // a real drag interrupts any busy chain (celebrate / eat / post-work nap),
+    // otherwise the dropped onEnd would leave busy stuck at true
+    if (moved) busy = false;
+    setState("idle");
+  }
   window.petAPI.dragEnd();
 });
 
@@ -808,8 +863,12 @@ function tickIdle() {
 // long-quiet sleep apart from the brief post-work nap (which stays visible).
 let naturalSleep = false;
 let petHidden = false;
+// set by bootChat while the in-window chat panel is visible — the window must
+// never auto-hide (hideWhenIdle) while the user is looking at the dialog
+let chatPanelVisible = false;
 function hidePet() {
   if (petHidden) return;
+  if (chatPanelVisible) return; // never vanish under an open chat panel
   petHidden = true;
   stopMotion(); // nothing to animate while hidden — save CPU
   if (window.petAPI && typeof window.petAPI.setWindowVisible === "function") {
@@ -1166,6 +1225,8 @@ function bootChat() {
   const closeBtn = document.getElementById("chat-close");
   const sessionsEl = document.getElementById("chat-sessions");
   const pickerBtn = document.getElementById("chat-session-picker");
+  const newBtn = document.getElementById("chat-new");
+  const statsEl = document.getElementById("chat-stats");
   const titleLabel = document.getElementById("chat-title-label");
 
   let busy = false;
@@ -1174,9 +1235,150 @@ function bootChat() {
   let sessions = []; // [{ id, title, preview, createdAt }]
   let currentSessionId = null;
   let chatInitialized = false;
+  let sessionsLoaded = false; // picker auto-revealed + refreshed on first open
+  // texts of messages we just sent from the pet — the plugin echoes the
+  // session's user/message event, and those echoes are deduped against this
+  // set (the optimistic bubble already shows the message)
+  const pendingUserEchoes = new Set();
+
+  // History loading is asynchronous (the plugin reads the session log and
+  // replies with a `history` signal). Two guards keep the panel honest:
+  //   1. staleness — only a `history` for the session the user is waiting for
+  //      (or, in mirror mode, ANY session) is applied, so a slow/stale
+  //      response can never clobber a newer view;
+  //   2. a watchdog — if the plugin never answers, the "⏳ 正在加载…" spinner
+  //      is replaced by a retry button instead of hanging forever. The plugin
+  //      reads live sessions from memory (instant) and waits for cold-log
+  //      reads like the web UI does, so 30s is a generous dead-man switch.
+  const HISTORY_LOAD_TIMEOUT_MS = 30_000;
+  let historyReqSeq = 0;    // bumps on every load request (invalidates old ones)
+  let pendingLoadId = null; // sessionId awaited; null = mirror mode
+  let pendingLoadTimer = 0;
+
+  /** Show a centered placeholder inside the message area. */
+  const showPlaceholder = (text) => {
+    messagesEl.innerHTML = "";
+    const box = document.createElement("div");
+    box.className = "chat-session-empty";
+    box.textContent = text;
+    messagesEl.append(box);
+  };
+
+  /** Replace the spinner with a timeout message + a retry button. The retry
+   *  re-arms the watchdog and re-issues the same request. */
+  const showLoadTimeout = (id, send) => {
+    const label = document.createElement("span");
+    label.textContent = "⏳ 加载超时，";
+    const retryBtn = document.createElement("button");
+    retryBtn.type = "button";
+    retryBtn.className = "chat-retry-btn";
+    retryBtn.textContent = "点击重试";
+    retryBtn.addEventListener("click", () => {
+      showPlaceholder("⏳ 正在加载历史对话…");
+      armHistoryWatchdog(id, send); // re-arms the watchdog and re-sends
+    });
+    messagesEl.innerHTML = "";
+    const box = document.createElement("div");
+    box.className = "chat-session-empty";
+    box.append(label, retryBtn);
+    messagesEl.append(box);
+    setHint("⚠️ 历史记录加载超时，请确认 DSH 插件已连接");
+  };
+
+  /** Arm the history-load watchdog, then issue the request.
+   *  @param id sessionId awaited (null = accept the next history signal)
+   *  @param send re-issuable request (also used by the retry button) */
+  const armHistoryWatchdog = (id, send) => {
+    pendingLoadId = id ?? null;
+    const seq = ++historyReqSeq;
+    clearTimeout(pendingLoadTimer);
+    pendingLoadTimer = setTimeout(() => {
+      if (seq !== historyReqSeq) return; // superseded by a newer request
+      showLoadTimeout(id, send);
+    }, HISTORY_LOAD_TIMEOUT_MS);
+    send();
+  };
+
+  // If the plugin bridge is down, a sent message would hang "Agent 思考中…"
+  // forever (the enqueue succeeds but nobody ever replies). Watchdog: any chat
+  // traffic while waiting resets it; silence past the timeout unblocks input.
+  const SEND_TIMEOUT_MS = 90_000;
+  let sendWatchdog = 0;
+  const armSendWatchdog = () => {
+    clearTimeout(sendWatchdog);
+    sendWatchdog = setTimeout(() => {
+      if (!busy) return;
+      busy = false;
+      assistantBubble = null;
+      if (inputEl) inputEl.disabled = false;
+      if (sendBtn) sendBtn.disabled = false;
+      setHint("⚠️ 长时间未收到回复，请确认 DSH 插件已连接");
+    }, SEND_TIMEOUT_MS);
+  };
+
+  /** Whether the transcript is scrolled to (near) the bottom — only then do
+   *  new messages auto-scroll, so reading older history isn't yanked away. */
+  const nearBottom = () =>
+    messagesEl.scrollHeight - messagesEl.scrollTop - messagesEl.clientHeight < 48;
+
+  /** Consecutive tool calls (no message row between them) merge into ONE
+   *  collapsible group — collapsed by default, the head shows the count plus
+   *  the LATEST tool's preview; click to expand the full run. A lone tool
+   *  call keeps the plain card look. */
+  let lastMsgWasTool = false; // the last appended row was a tool card
+  let lastToolCard = null;    // the most recent bare (ungrouped) tool card
+  let activeToolGroup = null; // the open group container, if any
+
+  /** A message row was appended — the current tool run ends here. */
+  const sealToolRun = () => {
+    lastMsgWasTool = false;
+    lastToolCard = null;
+    activeToolGroup = null;
+  };
+
+  /** Refresh a group's head: tool count, latest tool preview, running state. */
+  const syncToolGroup = (group) => {
+    if (!group) return;
+    const cards = [...group.querySelectorAll(".chat-tool-group-body > .chat-tool")];
+    const countEl = group.querySelector(".chat-tool-group-count");
+    if (countEl) countEl.textContent = `🛠️ 工具调用 × ${cards.length}`;
+    const last = cards[cards.length - 1];
+    const previewEl = group.querySelector(".chat-tool-group-preview");
+    if (previewEl) {
+      const name = last?.querySelector(".chat-tool-name")?.textContent ?? "";
+      const summary = last?.querySelector(".chat-tool-summary")?.textContent ?? "";
+      previewEl.textContent = summary ? `${name} · ${summary}` : name;
+    }
+    group.classList.toggle("running", cards.some((c) => c.hasAttribute("data-running")));
+  };
+
+  /** Build a collapsible tool group (collapsed by default). */
+  const createToolGroup = () => {
+    const group = document.createElement("div");
+    group.className = "chat-tool-group collapsed";
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "chat-tool-group-head";
+    const count = document.createElement("span");
+    count.className = "chat-tool-group-count";
+    const preview = document.createElement("span");
+    preview.className = "chat-tool-group-preview";
+    const chevron = document.createElement("span");
+    chevron.className = "chat-tool-group-chevron";
+    head.append(count, preview, chevron);
+    const body = document.createElement("div");
+    body.className = "chat-tool-group-body";
+    group.append(head, body);
+    head.addEventListener("click", () => {
+      const collapsed = group.classList.toggle("collapsed");
+      chevron.textContent = collapsed ? "▸" : "▾";
+    });
+    return group;
+  };
 
   /** Append one message row; returns the row element (for streaming). */
   const appendRow = (role, text) => {
+    sealToolRun(); // any message row ends the current tool run
     const row = document.createElement("div");
     row.className = `chat-row chat-${role}`;
     const bubbleEl = document.createElement("div");
@@ -1184,20 +1386,188 @@ function bootChat() {
     bubbleEl.textContent = text;
     row.append(bubbleEl);
     messagesEl.append(row);
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    if (nearBottom()) messagesEl.scrollTop = messagesEl.scrollHeight;
     return { row, bubbleEl };
   };
 
-  /** Render all buffered history. */
+  /** Render all buffered history (fresh view — always show the newest end).
+   *  Tool rows are drawn as frosted tool cards (with their output when done);
+   *  consecutive tool calls collapse into one group. */
   const renderHistory = () => {
     messagesEl.innerHTML = "";
-    for (const item of history) appendRow(item.role, item.text);
+    sealToolRun();
+    for (const item of history) {
+      if (item.role === "tool") {
+        appendToolCard(item);
+        if (item.done) finishToolCard(item);
+      } else {
+        appendRow(item.role, item.text);
+      }
+    }
+    messagesEl.scrollTop = messagesEl.scrollHeight;
   };
 
-  /** Replace history with one session's transcript rows. */
-  const showHistory = (rows) => {
-    history = Array.isArray(rows) ? rows.map((r) => ({ role: r.role === "user" ? "user" : "assistant", text: r.text ?? "" })) : [];
+  /** Replace history with one session's transcript rows (user/assistant text +
+   *  tool cards, so reopened sessions keep their tool-call records). When the
+   *  plugin only sent the RECENT tail (long / old conversation), a note at the
+   *  top tells the user earlier records were intentionally not loaded. */
+  const showHistory = (rows, truncated) => {
+    history = Array.isArray(rows) ? rows.map((r) => {
+      if (r.role === "tool") {
+        return {
+          role: "tool",
+          callId: r.callId,
+          tool: r.tool,
+          label: r.label,
+          summary: r.summary,
+          argsText: r.argsText,
+          output: r.output,
+          isError: r.isError,
+          done: r.done,
+        };
+      }
+      return { role: r.role === "user" ? "user" : "assistant", text: r.text ?? "" };
+    }) : [];
     renderHistory();
+    if (truncated && truncated.skipped > 0) {
+      const note = document.createElement("div");
+      note.className = "chat-truncated-note";
+      note.textContent = `⏳ 该会话较早/较长，仅显示最近 ${history.length} 条记录（已省略 ${truncated.skipped} 条更早的）`;
+      messagesEl.prepend(note);
+    }
+    if (!history.length) {
+      // explicit empty state — a blank transcript reads as "history missing"
+      const empty = document.createElement("div");
+      empty.className = "chat-session-empty";
+      empty.textContent = "该会话暂无消息记录";
+      messagesEl.append(empty);
+    }
+  };
+
+  /** Pretty-print a JSON string for the card's 输入 section (fallback to the
+   *  raw text when it is truncated or not valid JSON). */
+  const prettyJson = (json) => {
+    if (!json) return "";
+    try {
+      return JSON.stringify(JSON.parse(json), null, 2);
+    } catch {
+      return json;
+    }
+  };
+
+  /** Append (or update) a frosted web-style tool card: icon + name + target
+   *  summary, an io-style 输入 section with the arguments, and a running sweep;
+   *  finished via finishToolCard(). Re-sent tool signals for the same callId
+   *  update the existing card instead of stacking duplicates.
+   *
+   *  Consecutive tool calls (no user/assistant row between them) merge into
+   *  one collapsible group: the SECOND call upgrades the run into a group and
+   *  collapses it, leaving only the latest preview visible until expanded. */
+  const appendToolCard = (s) => {
+    let card = null;
+    if (s.callId) {
+      for (const el of messagesEl.querySelectorAll(".chat-tool")) {
+        if (el.dataset.callId === String(s.callId)) { card = el; break; }
+      }
+    }
+    let group = null;
+    if (card) {
+      group = card.closest(".chat-tool-group");
+    } else if (lastMsgWasTool) {
+      // continuing a run: append into the open group, or upgrade the last
+      // bare card into a group (the run now has 2+ calls)
+      if (activeToolGroup) {
+        group = activeToolGroup;
+      } else if (lastToolCard && lastToolCard.isConnected) {
+        group = createToolGroup();
+        lastToolCard.replaceWith(group);
+        group.querySelector(".chat-tool-group-body").append(lastToolCard);
+        activeToolGroup = group;
+      }
+    }
+    if (!card) {
+      card = document.createElement("div");
+      card.className = "chat-tool";
+      // a fresh tool/call means "running" — the sweep + gold highlight show
+      // until the matching tool-done (finishToolCard) clears it
+      card.dataset.running = "";
+      if (s.callId) card.dataset.callId = String(s.callId);
+      if (s.tool) card.dataset.tool = String(s.tool);
+      const head = document.createElement("div");
+      head.className = "chat-tool-head";
+      const icon = document.createElement("span");
+      icon.className = "chat-tool-icon";
+      icon.textContent = "🛠️";
+      const name = document.createElement("span");
+      name.className = "chat-tool-name";
+      name.textContent = s.label ?? s.tool ?? "工具";
+      const sep = document.createElement("span");
+      sep.className = "chat-tool-sep";
+      const summary = document.createElement("span");
+      summary.className = "chat-tool-summary";
+      summary.textContent = s.summary ?? "";
+      head.append(icon, name, sep, summary);
+      card.append(head);
+      if (group) {
+        group.querySelector(".chat-tool-group-body").append(card);
+      } else {
+        messagesEl.append(card);
+      }
+      lastToolCard = card;
+      lastMsgWasTool = true;
+    } else {
+      // update the header in place (streamed arguments refine the summary)
+      const summary = card.querySelector(".chat-tool-summary");
+      if (summary && s.summary) summary.textContent = s.summary;
+    }
+    if (s.argsText) {
+      // replace any previous 输入 section with the freshest arguments
+      const old = card.querySelector(".chat-tool-io[data-kind='in']");
+      if (old) old.remove();
+      const io = document.createElement("div");
+      io.className = "chat-tool-io";
+      io.dataset.kind = "in";
+      const label = document.createElement("span");
+      label.className = "chat-tool-io-label";
+      label.textContent = "输入";
+      const body = document.createElement("code");
+      body.className = "chat-tool-io-text";
+      body.textContent = prettyJson(s.argsText);
+      io.append(label, body);
+      card.append(io);
+    }
+    if (group) syncToolGroup(group);
+    if (nearBottom()) messagesEl.scrollTop = messagesEl.scrollHeight;
+  };
+
+  /** Finish the running tool card: stop the sweep and show the result. */
+  const finishToolCard = (s) => {
+    let card = null;
+    if (s.callId) {
+      for (const el of messagesEl.querySelectorAll(".chat-tool")) {
+        if (el.dataset.callId === String(s.callId)) { card = el; break; }
+      }
+    }
+    card = card ?? messagesEl.querySelector(".chat-tool[data-running]")
+      ?? [...messagesEl.querySelectorAll(".chat-tool")].at(-1) ?? null;
+    if (!card) return;
+    delete card.dataset.running;
+    if (s.output) {
+      const io = document.createElement("div");
+      io.className = "chat-tool-io";
+      io.dataset.kind = "out";
+      const label = document.createElement("span");
+      label.className = "chat-tool-io-label";
+      label.textContent = "输出";
+      const body = document.createElement("code");
+      body.className = "chat-tool-io-text";
+      if (s.isError) body.dataset.error = "";
+      body.textContent = s.output;
+      io.append(label, body);
+      card.append(io);
+    }
+    // the head's running sweep / preview follows the newest state inside
+    syncToolGroup(card.closest(".chat-tool-group"));
   };
 
   /** Render the session picker list. */
@@ -1210,6 +1580,10 @@ function bootChat() {
       sessionsEl.append(empty);
       return;
     }
+    const head = document.createElement("div");
+    head.className = "chat-sessions-head";
+    head.textContent = `历史会话 · ${sessions.length}`;
+    sessionsEl.append(head);
     for (const s of sessions) {
       const row = document.createElement("button");
       row.type = "button";
@@ -1217,21 +1591,32 @@ function bootChat() {
       const title = document.createElement("div");
       title.className = "chat-session-title";
       title.textContent = s.title ?? s.id;
+      const meta = document.createElement("div");
+      meta.className = "chat-session-meta";
+      if (s.createdAt) {
+        meta.textContent = new Date(s.createdAt).toLocaleString("zh-CN", {
+          month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+        });
+      }
       if (s.preview) {
         const preview = document.createElement("div");
         preview.className = "chat-session-preview";
         preview.textContent = s.preview;
-        row.append(title, preview);
+        row.append(title, preview, meta);
       } else {
-        row.append(title);
+        row.append(title, meta);
       }
       row.addEventListener("click", () => {
         currentSessionId = s.id;
-        titleLabel.textContent = `会话 · ${s.title ?? ""}`;
+        titleLabel.textContent = s.title?.trim() ? s.title : "🐳 与鲸鱼娘对话";
         sessionsEl.classList.add("hidden");
         renderSessions();
-        setHint("⏳ 加载历史…");
-        window.petAPI.selectSession(s.id);
+        // switching sessions: drop any in-flight streaming bubble and show a
+        // loading placeholder so "history not loaded yet" is never ambiguous
+        assistantBubble = null;
+        showPlaceholder("⏳ 正在加载历史对话…");
+        setHint("");
+        armHistoryWatchdog(s.id, () => window.petAPI.selectSession(s.id));
       });
       sessionsEl.append(row);
     }
@@ -1240,17 +1625,27 @@ function bootChat() {
   /** Handle one chat signal from the plugin. */
   const onChatSignal = (signal) => {
     if (!signal || signal.type !== "chat") return;
+    // any chat traffic while a pet-side send is pending means the bridge is
+    // alive — keep the watchdog from tripping on long but active turns
+    if (busy) armSendWatchdog();
     const kind = signal.kind;
     if (kind === "user") {
-      history.push({ role: "user", text: signal.text ?? "" });
-      appendRow("user", signal.text ?? "");
+      const text = signal.text ?? "";
+      // echo of a message WE just sent is already shown optimistically — the
+      // plugin also forwards the session's user/message event, so dedupe it
+      if (pendingUserEchoes.has(text)) {
+        pendingUserEchoes.delete(text);
+        return;
+      }
+      history.push({ role: "user", text });
+      appendRow("user", text);
     } else if (kind === "delta") {
       if (!assistantBubble) {
         const row = appendRow("assistant", "");
         assistantBubble = row.bubbleEl;
       }
       assistantBubble.textContent += signal.text ?? "";
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      if (nearBottom()) messagesEl.scrollTop = messagesEl.scrollHeight;
     } else if (kind === "assistant") {
       // full assembled reply replaces the streaming bubble (identical text)
       history.push({ role: "assistant", text: signal.text ?? "" });
@@ -1264,30 +1659,119 @@ function bootChat() {
       assistantBubble = null;
       busy = false;
       setHint("");
+      const wasBusyInput = !!(inputEl && inputEl.disabled);
       if (inputEl) inputEl.disabled = false;
       if (sendBtn) sendBtn.disabled = false;
-      if (inputEl) inputEl.focus();
+      // only reclaim focus after a pet-side send — a web-driven stream must
+      // not yank the keyboard away from the browser
+      if (wasBusyInput && inputEl) inputEl.focus();
     } else if (kind === "error") {
       history.push({ role: "assistant", text: `⚠️ ${signal.text ?? "出错了"}` });
       appendRow("assistant", `⚠️ ${signal.text ?? "出错了"}`);
       assistantBubble = null;
       busy = false;
       setHint("");
+      const wasBusyInput = !!(inputEl && inputEl.disabled);
       if (inputEl) inputEl.disabled = false;
       if (sendBtn) sendBtn.disabled = false;
+      if (wasBusyInput && inputEl) inputEl.focus();
+    } else if (kind === "tool") {
+      appendToolCard(signal);
+    } else if (kind === "tool-done") {
+      finishToolCard(signal);
+    } else if (kind === "stats") {
+      renderChatStats(signal);
     } else if (kind === "sessions") {
       sessions = Array.isArray(signal.list) ? signal.list : [];
       renderSessions();
-    } else if (kind === "history") {
-      showHistory(signal.rows);
+    } else if (kind === "new-session") {
+      // the plugin created a fresh session and pinned the chat to it — show a
+      // clean slate so the user knows they're in a brand-new conversation
+      clearTimeout(pendingLoadTimer);
+      pendingLoadId = null;
+      historyReqSeq++;
       currentSessionId = signal.sessionId ?? null;
-      setHint("💬 在下方输入消息继续这个对话");
+      assistantBubble = null;
+      pendingUserEchoes.clear();
+      history = [];
+      busy = false;
+      clearTimeout(sendWatchdog);
+      if (inputEl) inputEl.disabled = false;
+      if (sendBtn) sendBtn.disabled = false;
+      messagesEl.innerHTML = "";
+      const welcome = document.createElement("div");
+      welcome.className = "chat-session-empty";
+      welcome.textContent = "🐳 新对话已开启，来说点什么吧！";
+      messagesEl.append(welcome);
+      titleLabel.textContent = "🐳 与鲸鱼娘对话";
+      if (statsEl) statsEl.textContent = "";
+      setHint("💬 输入消息开始新的对话");
       if (inputEl) inputEl.focus();
+    } else if (kind === "history") {
+      const nextId = signal.sessionId ?? null;
+      // Stale-response guard: while a specific session load is pending, a
+      // history signal for a DIFFERENT session is dropped — a slow response
+      // must never clobber the view the user just asked for.
+      if (pendingLoadId !== null && nextId !== pendingLoadId) return;
+      clearTimeout(pendingLoadTimer);
+      pendingLoadId = null;
+      if (signal.failed) {
+        // the plugin could not read the log in time — offer a retry instead
+        // of pretending the session is empty
+        showLoadTimeout(nextId, () => window.petAPI.selectSession(nextId));
+        return;
+      }
+      const switched = nextId !== null && nextId !== currentSessionId;
+      currentSessionId = nextId;
+      if (nextId === null) {
+        // the plugin has nothing to mirror yet — keep the panel clean
+        messagesEl.innerHTML = "";
+        setHint("💬 先在网页中打开一个会话，这里会自动跟随");
+        return;
+      }
+      showHistory(signal.rows, signal.truncated);
+      if (switched) {
+        // the view moved to another conversation: drop any stale streaming
+        // bubble / pending echoes and update the title to the new session
+        assistantBubble = null;
+        pendingUserEchoes.clear();
+      }
+      if (signal.title) titleLabel.textContent = signal.title;
+      setHint(signal.follow ? "📡 正在跟随网页会话，输入消息会发送到该会话" : "💬 在下方输入消息继续这个对话");
+      // focus only for user-initiated loads (picker / panel open) — a web-side
+      // follow switch must not steal focus from the browser
+      if (!signal.follow && inputEl) inputEl.focus();
     }
   };
 
   const setHint = (text) => {
     if (hintEl) hintEl.textContent = text;
+  };
+
+  /** Format token counts like the web ("1.2k" / "3.4M"). */
+  const fmtTokens = (n) => {
+    n = n ?? 0;
+    if (n >= 1000000) return `${(n / 1000000).toFixed(1)}M`;
+    if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+    return String(n);
+  };
+
+  /** Render the 轮次 / token / 缓存命中 readout under the input (web-style). */
+  const renderChatStats = (s) => {
+    if (!statsEl) return;
+    const parts = [];
+    if (s.turn) parts.push(`轮次 ${s.turn}`);
+    const input = s.inputTokens ?? 0;
+    const output = s.outputTokens ?? 0;
+    const cacheRead = s.cacheReadTokens ?? 0;
+    const billed = input + cacheRead + (s.cacheWriteTokens ?? 0);
+    if (billed > 0 || output > 0) {
+      parts.push(`输入 ${fmtTokens(input)} tok · 输出 ${fmtTokens(output)} tok`);
+      if (cacheRead > 0 && billed > 0) {
+        parts.push(`缓存命中 ${Math.round((cacheRead / billed) * 100)}%`);
+      }
+    }
+    statsEl.textContent = parts.join("  ·  ");
   };
 
   /** Submit the current input to the agent. */
@@ -1298,17 +1782,20 @@ function bootChat() {
     inputEl.value = "";
     history.push({ role: "user", text });
     appendRow("user", text);
+    pendingUserEchoes.add(text); // the plugin echoes this event — dedupe it
     busy = true;
     assistantBubble = null;
     if (inputEl) inputEl.disabled = true;
     if (sendBtn) sendBtn.disabled = true;
     setHint("⏳ Agent 思考中…");
+    armSendWatchdog(); // unblock the input if the plugin bridge never answers
     const result = await window.petAPI.sendChat(text);
     if (!result?.ok) {
       const errText = result?.error ?? "无法连接 Agent（插件桥未启动）";
       history.push({ role: "assistant", text: `⚠️ ${errText}` });
       appendRow("assistant", `⚠️ ${errText}`);
       busy = false;
+      clearTimeout(sendWatchdog);
       setHint("");
       if (inputEl) inputEl.disabled = false;
       if (sendBtn) sendBtn.disabled = false;
@@ -1317,21 +1804,105 @@ function bootChat() {
 
   const onChatPanel = (payload) => {
     const open = !!payload?.open;
+    chatPanelVisible = open;
     chatEl.classList.toggle("hidden", !open);
+    document.body.dataset.chatOpen = open ? "1" : "";
     if (open) {
+      // the main process keeps the pet at its exact on-screen spot: the panel
+      // may grow LEFT of the pet (data-chat-side="left") or UP past it
+      // (--pet-shift-y) — apply the layout the window was grown for
+      document.body.dataset.chatSide = payload?.side === "left" ? "left" : "right";
+      document.body.style.setProperty("--pet-shift-y", `${payload?.shiftY ?? 0}px`);
       if (!chatInitialized) {
         chatInitialized = true;
         if (window.petAPI && typeof window.petAPI.onSignal === "function") {
           window.petAPI.onSignal(onChatSignal);
         }
       }
+      // first open: reveal the history picker (it populates in the
+      // background — the transcript below has priority on the chat queue)
+      if (!sessionsLoaded) {
+        sessionsLoaded = true;
+        sessionsEl.classList.remove("hidden");
+      }
+      // mirror the web's current conversation into the panel right away, so
+      // messages typed in the web UI show up here without any extra click.
+      // Sent FIRST so the plugin answers the transcript before the picker
+      // scan (the watchdog turns a never-arriving reply into a retry button).
+      if (window.petAPI && typeof window.petAPI.currentSession === "function") {
+        armHistoryWatchdog(null, () => window.petAPI.currentSession());
+      }
+      if (window.petAPI && typeof window.petAPI.listSessions === "function") {
+        window.petAPI.listSessions();
+      }
       setHint("💬 点击 🗂️ 选择历史会话，或直接输入消息");
       if (inputEl) inputEl.focus();
+    } else {
+      // closing: restore the pet's default layout (top-left, no shift)
+      delete document.body.dataset.chatSide;
+      document.body.style.removeProperty("--pet-shift-y");
+      // ...and drop the pinned chat target — the next open follows the web
+      clearTimeout(pendingLoadTimer);
+      pendingLoadId = null;
+      historyReqSeq++;
+      if (window.petAPI && typeof window.petAPI.resetChatTarget === "function") {
+        window.petAPI.resetChatTarget();
+      }
     }
   };
 
   if (window.petAPI && typeof window.petAPI.onChatPanel === "function") {
     window.petAPI.onChatPanel(onChatPanel);
+  }
+  // drag the whole chat window from the title bar (buttons keep their clicks):
+  // reuses the pet-drag plumbing (main anchors + applies deltas) but leaves
+  // the pet's state machine untouched
+  chatEl.querySelector(".chat-title")?.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (pierceMode) return;
+    if (e.target.closest("button")) return; // 🗂️ ➕ ⛶ ✕ keep their own handlers
+    e.preventDefault();
+    dragSource = "title";
+    drag = { startScreenX: e.screenX, startScreenY: e.screenY, moved: false };
+    window.petAPI.dragStart();
+  });
+  // resize handles: the LEFT / RIGHT edges stretch the panel width, the
+  // bottom edge the height. Deltas go to main, which anchors the pet.
+  const beginResize = (e, mode) => {
+    if (e.button !== 0) return;
+    if (pierceMode) return;
+    e.preventDefault();
+    e.stopPropagation();
+    resizing = { startX: e.screenX, startY: e.screenY, mode };
+    if (window.petAPI && typeof window.petAPI.chatResizeStart === "function") {
+      window.petAPI.chatResizeStart();
+    }
+  };
+  chatEl.querySelector(".chat-resize-left")?.addEventListener("mousedown", (e) => beginResize(e, "left"));
+  chatEl.querySelector(".chat-resize-right")?.addEventListener("mousedown", (e) => beginResize(e, "right"));
+  chatEl.querySelector(".chat-resize-bottom")?.addEventListener("mousedown", (e) => beginResize(e, "bottom"));
+  // one-click maximize / restore: fills the work area beside the pet, or
+  // returns to the size remembered before maximizing
+  const maximizeBtn = chatEl.querySelector("#chat-maximize");
+  maximizeBtn?.addEventListener("click", () => {
+    if (window.petAPI && typeof window.petAPI.chatMaximize === "function") {
+      window.petAPI.chatMaximize();
+    }
+  });
+  if (window.petAPI && typeof window.petAPI.onChatMaximized === "function") {
+    window.petAPI.onChatMaximized((payload) => {
+      const on = !!(payload && payload.on);
+      maximizeBtn?.classList.toggle("active", on);
+      if (maximizeBtn) maximizeBtn.title = on ? "还原面板大小" : "最大化 / 还原面板大小";
+      if (maximizeBtn) maximizeBtn.textContent = on ? "🗗" : "⛶";
+    });
+  }
+  // height resizes near the screen bottom shift the window top; main tells us
+  // the new sprite offset so the pet stays at its exact screen spot
+  if (window.petAPI && typeof window.petAPI.onChatShift === "function") {
+    window.petAPI.onChatShift((shiftY) => {
+      document.body.style.setProperty("--pet-shift-y", `${shiftY ?? 0}px`);
+    });
   }
   sendBtn.addEventListener("click", send);
   inputEl.addEventListener("keydown", (e) => {
@@ -1345,6 +1916,31 @@ function bootChat() {
     sessionsEl.classList.toggle("hidden");
     if (!sessionsEl.classList.contains("hidden") && window.petAPI) {
       window.petAPI.listSessions();
+    }
+  });
+  newBtn.addEventListener("click", () => {
+    if (busy) return;
+    // clear the view right away for responsiveness; the plugin confirms with a
+    // `new-session` signal (or an error) — the watchdog unblocks on silence
+    clearTimeout(pendingLoadTimer);
+    pendingLoadId = null;
+    historyReqSeq++;
+    currentSessionId = null;
+    assistantBubble = null;
+    pendingUserEchoes.clear();
+    history = [];
+    messagesEl.innerHTML = "";
+    const loading = document.createElement("div");
+    loading.className = "chat-session-empty";
+    loading.textContent = "⏳ 正在开启新对话…";
+    messagesEl.append(loading);
+    setHint("");
+    if (inputEl) inputEl.disabled = true;
+    if (sendBtn) sendBtn.disabled = true;
+    busy = true;
+    armSendWatchdog();
+    if (window.petAPI && typeof window.petAPI.newSession === "function") {
+      window.petAPI.newSession();
     }
   });
 }
