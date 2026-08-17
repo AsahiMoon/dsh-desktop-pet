@@ -60,6 +60,7 @@
     "main.js",
     "preload.js",
     "renderer/",
+    "assets/1.png",
     "assets/characters/whale-girl/",
     "cordis.patch.yml",
     "docs/screenshot.png",

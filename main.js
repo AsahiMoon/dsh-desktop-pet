@@ -852,6 +852,21 @@ function createWindow() {
 // tray
 // ---------------------------------------------------------------------------
 function trayIcon() {
+  // Custom tray icon: use assets/1.png when present (ships with the package).
+  // Resize for the platform; fall back to the whale-girl idle frame so the
+  // tray is never blank when that file is missing.
+  const customPng = path.join(ROOT, "assets", "1.png");
+  try {
+    if (fs.existsSync(customPng)) {
+      const custom = nativeImage.createFromPath(customPng);
+      if (!custom.isEmpty()) {
+        const size = process.platform === "win32" ? 32 : 16;
+        return custom.resize({ width: size, height: size, quality: "best" });
+      }
+    }
+  } catch {
+    /* fall through to whale-girl */
+  }
   // always use whale-girl art: codex characters have no idle.png, and
   // createFromPath silently returns an EMPTY image for missing files — an
   // invisible tray icon. Resolves the user copy first (customized art wins),
