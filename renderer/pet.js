@@ -1116,6 +1116,14 @@ const FALLBACK_STATES = {
 // settings window mode: declared at the TOP of this file (see SETTINGS_MODE)
 
 async function boot() {
+  // The chat panel's open flag (data-chat-open) hides the task-progress box
+  // via CSS while the panel is open. It must never survive a boot: the panel
+  // is closed on startup by definition, so clear any stale residue (an older
+  // client that failed to remove it on panel-close would otherwise keep the
+  // black caption hidden forever).
+  delete document.body.dataset.chatOpen;
+  delete document.body.dataset.chatSide;
+  document.body.style.removeProperty("--pet-shift-y");
   // config + roles from the main process (hot config arrives as signals later)
   try {
     const init = await window.petAPI.getConfig();
@@ -1906,6 +1914,12 @@ function bootChat() {
       }
     } else {
       // closing: restore the pet's default layout (top-left, no shift)
+      // CRITICAL: also clear data-chat-open — leaving it set keeps the CSS
+      // rule body[data-chat-open] #statusbar { display:none !important } in
+      // force, so the task-progress box could never reappear after the panel
+      // was closed once (the black caption stayed hidden forever until the
+      // pet window reloaded).
+      delete document.body.dataset.chatOpen;
       delete document.body.dataset.chatSide;
       document.body.style.removeProperty("--pet-shift-y");
       // ...and drop the pinned chat target — the next open is blank again
