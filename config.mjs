@@ -3,8 +3,32 @@
  * Registered with the DSH settings service by index.mjs; pushed to the pet
  * window as { type: 'config' } signals (hot-reloaded). The standalone exe
  * reads the same shape from %APPDATA%/dsh-desktop-pet/config.json.
+ *
+ * `schemastery` is NOT a hard load-time dependency: it is required lazily
+ * inside buildSchema() (and null'd when absent) so a bare `dsh plugin add`
+ * link-install — which pnpm never equips with the bundle's dependencies —
+ * still loads DEFAULTS / NAMESPACE / validateConfig and runs the pet. When
+ * the package IS resolvable (registry install hoists it, or a full
+ * `npm install` in the checkout), the schema path activates and the DSH
+ * settings section works. This keeps "install and it just works" intact
+ * without forcing a ~heavy schemastery pre-requisite into the link profile.
  */
-import z from "schemastery";
+import { createRequire } from "node:module";
+
+const require = createRequire(import.meta.url);
+
+/** Try to obtain the schemastery constructor; null when not resolvable. */
+let cachedSchema; // undefined = not tried yet
+function loadSchemaModule() {
+  if (cachedSchema === undefined) {
+    try {
+      cachedSchema = require("schemastery");
+    } catch {
+      cachedSchema = null; // not resolvable from this tree
+    }
+  }
+  return cachedSchema;
+}
 
 export const NAMESPACE = "dsh-desktop-pet";
 
@@ -20,15 +44,19 @@ export const DEFAULTS = Object.freeze({
   },
   sleepAfterMs: 60000, // idle -> sleep threshold
   bottomMode: false, // pin the pet below other windows (desktop wallpaper style)
-  taskBarPersistent: false, // keep the task-progress caption always visible
-  taskBarDetailed: false, // persistent caption shows detailed progress + completed tasks
+  taskBarPersistent: true, // keep the task-progress caption always visible (default on)
+  taskBarDetailed: true, // persistent caption shows detailed progress + completed tasks (default on)
   hideWhenIdle: false, // hide the pet window entirely during its long-quiet sleep
   chatWidth: 300, // chat panel width px (user-resizable, remembered)
   chatHeight: 560, // chat panel height px (user-resizable, remembered)
 });
 
-/** schemastery schema for settings.register (defaults mirror DEFAULTS). */
+/** schemastery schema for settings.register (defaults mirror DEFAULTS).
+ *  Returns the schema, or null when schemastery is not resolvable (bare
+ *  link-install) — callers must treat null as "no settings section". */
 export function buildSchema() {
+  const z = loadSchemaModule();
+  if (!z) return null;
   return z.object({
     size: z.number().min(64).max(256).default(DEFAULTS.size),
     opacity: z.number().min(0.2).max(1).default(DEFAULTS.opacity),

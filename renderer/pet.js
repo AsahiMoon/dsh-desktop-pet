@@ -22,8 +22,8 @@ const DEFAULT_CONFIG = Object.freeze({
   character: "whale-girl",
   walk: { enabled: true, intervalMs: 300000, durationMs: 26000 },
   sleepAfterMs: 60000,
-  taskBarPersistent: false,
-  taskBarDetailed: false,
+  taskBarPersistent: true,
+  taskBarDetailed: true,
   hideWhenIdle: false,
   chatWidth: 300, // chat panel size (user-resizable; main process owns sizing)
   chatHeight: 560,

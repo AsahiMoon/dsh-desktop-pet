@@ -86,27 +86,25 @@ async function inspectWithTimeout(persistence, sessionId) {
   }
 }
 
-/** Resolve an executable that can run main.js: the electron package when it is
- *  installed anywhere up the node_modules tree (dev setups, local installs),
- *  or the standalone installed app when electron is absent (npm-published
- *  installs — electron is a devDependency, so a plain `npm install` of this
- *  bundle does not ship it). Returns null when neither exists. */
+/** Resolve the electron *module* binary path (not the standalone app): returns
+ *  the electron executable path string when the electron package resolves from
+ *  this bundle, else null. Synchronous on purpose — `createRequire` from this
+ *  module resolves the path string every call (never poisoned by a cached
+ *  module-load failure), so re-resolution after a local bootstrap install works.
+ *  `import.meta.url` is provided by Node; `createRequire` maps it to a working
+ *  `require`. */
 let electronPath = null;
-try {
-  const mod = await import("electron");
-  electronPath = typeof mod.default === "string" ? mod.default : null;
-} catch {
-  /* not resolvable from this tree */
-}
-if (!electronPath) {
+function resolveElectronModulePath() {
   try {
     const req = createRequire(import.meta.url);
     const mod = req("electron");
-    electronPath = typeof mod === "string" ? mod : null;
+    if (typeof mod === "string") return mod;
   } catch {
-    /* electron not installed anywhere up the tree */
+    /* not resolvable up the tree */
   }
+  return null;
 }
+electronPath = resolveElectronModulePath();
 
 /** Find the user-installed standalone pet executable (electron-builder NSIS
  *  default per-user install dir, or anywhere under Program Files). */
@@ -216,12 +214,65 @@ function ensurePet() {
   }
 }
 
+// ---------------------------------------------------------------------------
+// electron bootstrap (self-contained install, one-shot)
+// ---------------------------------------------------------------------------
+// A plain `dsh plugin add <path>` link-install never ships an electron binary
+// (electron stays in devDependencies and pnpm does not materialize a linked
+// bundle's own node_modules). When neither the electron module nor a
+// standalone pet exe resolves, we asynchronously install a LOCAL electron
+// copy into THIS bundle's node_modules (`npm install electron@^33 --no-save`
+// with cwd = ROOT), then re-resolve and spawn. The install is:
+//  - one-shot: a failure is NOT retried (the pet simply stays off; the user
+//    can run `npm install` / `npm run dist` themselves, or install the exe);
+//  - single-flight: concurrent calls never start a second npm;
+//  - non-fatal: errors are logged, never thrown into boot.
+// Choosing the pinned major (^33) keeps parity with the devDependency the
+// project was built and smoke-tested against.
+let electronBootstrapStarted = false;
+function bootPetWindow() {
+  const exe = electronPath ?? findInstalledPetExe();
+  if (exe) {
+    ensurePet();
+    return;
+  }
+  if (electronBootstrapStarted) return; // one attempt, ever
+  electronBootstrapStarted = true;
+  console.log("[dsh-desktop-pet] no electron / standalone exe found — installing a local electron copy (one-time, ~100MB), the pet window will appear when done");
+  const npmBin = process.platform === "win32" ? "npm.cmd" : "npm";
+  let child;
+  try {
+    child = spawn(npmBin, ["install", "electron@^33", "--no-save", "--no-audit", "--no-fund"], {
+      cwd: ROOT,
+      stdio: "ignore",
+      windowsHide: true,
+      shell: process.platform === "win32",
+    });
+  } catch (err) {
+    console.error("[dsh-desktop-pet] electron bootstrap spawn failed:", err?.message ?? err);
+    return;
+  }
+  child.on("error", (err) => {
+    console.error("[dsh-desktop-pet] electron bootstrap failed:", err?.message ?? err);
+  });
+  child.on("exit", (code) => {
+    if (code === 0) {
+      // re-resolve: createRequire now finds node_modules/electron from ROOT
+      electronPath = resolveElectronModulePath();
+      if (electronPath) ensurePet();
+      else console.error("[dsh-desktop-pet] electron installed but not resolvable — check the bundle's node_modules");
+    } else {
+      console.error(`[dsh-desktop-pet] electron bootstrap exited with code ${code} — run \`npm install\` in ${ROOT} or install the standalone app`);
+    }
+  });
+}
+
 /**
  * Cordis plugin apply.
  * @param {import('@deepseek-ai/cordis').Context} ctx
  */
 export function apply(ctx) {
-  ensurePet();
+  bootPetWindow();
 
   // ---- chat bridge: collect commands from the pet window, forward replies ----
   // The pet window never exposes a port: this half LONG-POLLS the pet's own
@@ -868,15 +919,21 @@ export function apply(ctx) {
   let config = { ...DEFAULTS };
   if (settings !== undefined && typeof settings.register === "function") {
     try {
-      const scope = settings.register(NAMESPACE, buildSchema(), {
-        applies: "live",
-        validate: validateConfig,
-      });
-      config = { ...DEFAULTS, ...(scope.get() ?? {}) };
-      scope.watch((next) => {
-        config = { ...DEFAULTS, ...(next ?? {}) };
-        sendSignal({ type: "config", config });
-      });
+      // buildSchema() returns null when schemastery is not resolvable (bare
+      // link-install) — then there is no settings section, and the pet simply
+      // runs on DEFAULTS + its own config.json until a full install provides it.
+      const schema = buildSchema();
+      if (schema) {
+        const scope = settings.register(NAMESPACE, schema, {
+          applies: "live",
+          validate: validateConfig,
+        });
+        config = { ...DEFAULTS, ...(scope.get() ?? {}) };
+        scope.watch((next) => {
+          config = { ...DEFAULTS, ...(next ?? {}) };
+          sendSignal({ type: "config", config });
+        });
+      }
     } catch (err) {
       console.error("[dsh-desktop-pet] settings register failed:", err?.message ?? err);
     }

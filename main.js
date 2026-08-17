@@ -98,8 +98,8 @@ const DEFAULT_CONFIG = Object.freeze({
   walk: { enabled: true, intervalMs: 300000, durationMs: 26000 },
   sleepAfterMs: 60000,
   bottomMode: false, // pin the pet below other windows (desktop wallpaper style)
-  taskBarPersistent: false, // keep the task-progress caption always visible
-  taskBarDetailed: false, // persistent caption shows detailed progress + completed tasks
+  taskBarPersistent: true, // keep the task-progress caption always visible (default on)
+  taskBarDetailed: true, // persistent caption shows detailed progress + completed tasks (default on)
   hideWhenIdle: false, // hide the pet window entirely during its long-quiet sleep
   chatWidth: 300, // chat panel width px (user-resizable, remembered)
   chatHeight: 560, // chat panel height px (user-resizable, remembered)
