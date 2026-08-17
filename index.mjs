@@ -947,9 +947,6 @@ export function apply(ctx) {
   let waiting = false;
   let activeTools = 0;
   let lastTodo = [];
-  // tool arguments arrive as STREAMING chunks (argumentsDelta fragments keyed by
-  // callId) — accumulate them so the pet can show the tool's actual target
-  const toolArgs = new Map();
 
   // When several sessions exist (multiple agents in the web UI), concurrent
   // sessions would fight over the pet's one state box. Only the MOST RECENTLY
@@ -1174,30 +1171,25 @@ export function apply(ctx) {
           sendSignal({ type: "celebrate", label: "回合完成" });
         }
       } else if (type === "tool/call") {
-        // the model asked for a tool — show what it is doing (codex-pet style).
-        // tool/call events are STREAMING chunks: { chunk: { id, name?, argumentsDelta } },
-        // so accumulate the argument fragments and attach the parsed target.
+        // The model asked for a tool — show it in the black progress box.
+        // DSH session `tool/call` events carry the COMPLETE raw arguments JSON
+        // string ({ callId, name, arguments } — see dsh-session types), so the
+        // target (file path / query / command) parses in ONE step; there are no
+        // streaming argument fragments at this layer.
         activeTools++;
-        const chunk = event?.data?.chunk ?? {};
-        const name = event?.data?.name ?? chunk.name;
-        const callId = event?.data?.callId ?? chunk.id;
-        if (chunk.argumentsDelta && callId) {
-          toolArgs.set(callId, (toolArgs.get(callId) ?? "") + chunk.argumentsDelta);
-          if (toolArgs.size > 64) toolArgs.clear(); // guard against leaked calls
-        }
+        const name = event?.data?.name;
+        const callId = event?.data?.callId;
         let detail = null;
-        if (name && callId && toolArgs.has(callId)) {
+        if (name && typeof event?.data?.arguments === "string") {
           try {
-            detail = toolDetailOf(name, JSON.parse(toolArgs.get(callId)));
+            detail = toolDetailOf(name, JSON.parse(event.data.arguments));
           } catch {
-            /* partial JSON mid-stream — keep the previous detail */
+            /* unparseable arguments — keep a header-only caption */
           }
         }
         sendSignal({ type: "exec", tool: name, label: toolLabel(name), detail });
       } else if (type === "tool/result") {
         activeTools = Math.max(0, activeTools - 1);
-        const callId = event?.data?.message?.source?.callId ?? event?.data?.callId;
-        if (callId) toolArgs.delete(callId);
         if (activeTools === 0) sendSignal({ type: "tool-done" });
       } else if (type === "todo/write") {
         // progress snapshot: [{ content, status }]
