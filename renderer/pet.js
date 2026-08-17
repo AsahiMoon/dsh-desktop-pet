@@ -1797,6 +1797,10 @@ function bootChat() {
         assistantBubble = null;
         pendingUserEchoes.clear();
       }
+      // a real session is now loaded — ENABLE the composer (it was disabled
+      // while the panel waited for the user to pick a conversation).
+      if (inputEl) inputEl.disabled = false;
+      if (sendBtn) sendBtn.disabled = false;
       if (signal.title) titleLabel.textContent = signal.title;
       setHint(signal.follow ? "📡 正在跟随网页会话，输入消息会发送到该会话" : "💬 在下方输入消息继续这个对话");
       // focus only for user-initiated loads (picker / panel open) — a web-side
